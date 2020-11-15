@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -259,7 +259,6 @@ static ssize_t wdog_disable_set(struct device *dev,
 	int ret;
 	u8 disable;
 	struct msm_watchdog_data *wdog_dd = dev_get_drvdata(dev);
-	struct scm_desc desc = {0};
 
 	ret = kstrtou8(buf, 10, &disable);
 	if (ret) {
@@ -274,11 +273,17 @@ static ssize_t wdog_disable_set(struct device *dev,
 			return count;
 		}
 		disable = 1;
+		if (!is_scm_armv8()) {
+			ret = scm_call(SCM_SVC_BOOT, SCM_SVC_SEC_WDOG_DIS,
+				       &disable, sizeof(disable), NULL, 0);
+		} else {
+			struct scm_desc desc = {0};
 
-		desc.args[0] = 1;
-		desc.arginfo = SCM_ARGS(1);
-		ret = scm_call2(SCM_SIP_FNID(SCM_SVC_BOOT,
-						SCM_SVC_SEC_WDOG_DIS), &desc);
+			desc.args[0] = 1;
+			desc.arginfo = SCM_ARGS(1);
+			ret = scm_call2(SCM_SIP_FNID(SCM_SVC_BOOT,
+					SCM_SVC_SEC_WDOG_DIS), &desc);
+		}
 		if (ret) {
 			dev_err(wdog_dd->dev,
 					"Failed to deactivate secure wdog\n");
@@ -1041,8 +1046,7 @@ err:
 }
 
 static const struct dev_pm_ops msm_watchdog_dev_pm_ops = {
-	.suspend_noirq = msm_watchdog_suspend,
-	.resume_noirq = msm_watchdog_resume,
+	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(msm_watchdog_suspend, msm_watchdog_resume)
 };
 
 static struct platform_driver msm_watchdog_driver = {

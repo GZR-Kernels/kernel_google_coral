@@ -28,7 +28,7 @@
 #include <linux/regulator/consumer.h>
 #include <linux/clk.h>
 
-#if defined(CONFIG_CNSS)
+#if defined(CONFIG_CNSS_PCI)
 #include <net/cnss.h>
 #endif
 
@@ -55,6 +55,7 @@ static struct bt_power_vreg_data bt_power_vreg_info[] = {
 	{NULL, "qca,bt-vdd-vl", 1055000, 1055000, 0, false, false},
 	{NULL, "qca,bt-vdd-vm", 1350000, 1350000, 0, false, false},
 	{NULL, "qca,bt-vdd-5c", 2040000, 2040000, 0, false, false},
+	{NULL, "qca,bt-vdd-5a", 2040000, 2040000, 0, false, false},
 	{NULL, "qca,bt-vdd-vh", 1900000, 1900000, 0, false, false},
 	{NULL, "qca,bt-vdd-io", 1700000, 1900000, 0, false, false},
 	{NULL, "qca,bt-vdd-xtal", 1700000, 1900000, 0, false, false},
@@ -91,6 +92,7 @@ static int bt_vreg_init(struct bt_power_vreg_data *vreg)
 		rc = PTR_ERR(vreg->reg);
 		pr_err("%s: regulator_get(%s) failed. rc=%d\n",
 			__func__, vreg->name, rc);
+		vreg->reg = NULL;
 		goto out;
 	}
 
@@ -337,7 +339,7 @@ static const struct rfkill_ops bluetooth_power_rfkill_ops = {
 	.set_block = bluetooth_toggle_radio,
 };
 
-#if defined(CONFIG_CNSS)
+#if defined(CONFIG_CNSS_PCI)
 static ssize_t enable_extldo(struct device *dev, struct device_attribute *attr,
 			char *buf)
 {

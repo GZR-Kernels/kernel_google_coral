@@ -1676,6 +1676,12 @@ static int find_num_channels(struct mixer_build *state, int dir)
 		if (intf != ctrlif) {
 			struct usb_interface *iface =
 				usb_ifnum_to_if(state->mixer->chip->dev, intf);
+			if (!iface)
+				continue;
+
+			num = iface->num_altsetting;
+			if (num < 2)
+				continue;
 
 			alts = &iface->altsetting[1];
 			if (dir == USB_DIR_OUT &&
@@ -1686,7 +1692,6 @@ static int find_num_channels(struct mixer_build *state, int dir)
 				!(get_endpoint(alts, 0)->bEndpointAddress &
 				USB_DIR_IN))
 				continue;
-			num = iface->num_altsetting;
 			for (j = 1; j < num; j++) {
 				num_ch = NUM_CHANNELS_MONO;
 				alts = &iface->altsetting[j];
@@ -2089,7 +2094,9 @@ static int parse_audio_mixer_unit(struct mixer_build *state, int unitid,
 	} else {
 		input_pins = desc->bNrInPins;
 		num_outs = uac_mixer_unit_bNrChannels(desc);
-		if (desc->bLength < 11 || !input_pins || !num_outs) {
+		if (desc->bLength < 11 || !input_pins ||
+		    desc->bLength < sizeof(*desc) + desc->bNrInPins ||
+		    !num_outs) {
 			usb_audio_err(state->chip,
 				      "invalid MIXER UNIT descriptor %d\n",
 				      unitid);
@@ -2743,7 +2750,7 @@ static int snd_usb_mixer_controls(struct usb_mixer_interface *mixer)
 		if (map->id == state.chip->usb_id) {
 			state.map = map->map;
 			state.selector_map = map->selector_map;
-			mixer->ignore_ctl_error = map->ignore_ctl_error;
+			mixer->ignore_ctl_error |= map->ignore_ctl_error;
 			break;
 		}
 	}

@@ -45,6 +45,7 @@
 #define DWC3_EP0_SETUP_SIZE	512
 #define DWC3_ENDPOINTS_NUM	32
 #define DWC3_XHCI_RESOURCES_NUM	2
+#define MAX_ERROR_RECOVERY_TRIES	3
 
 #define DWC3_SCRATCHBUF_SIZE	4096	/* each buffer is assumed to be 4KiB */
 #define DWC3_EVENT_BUFFERS_SIZE	4096
@@ -219,6 +220,7 @@
 #define DWC3_GCTL_DSBLCLKGTNG		BIT(0)
 
 /* Global User Control 1 Register */
+#define DWC3_GUCTL1_PARKMODE_DISABLE_SS	BIT(17)
 #define DWC3_GUCTL1_TX_IPGAP_LINECHECK_DIS	BIT(28)
 #define DWC3_GUCTL1_DEV_L1_EXIT_BY_HW	BIT(24)
 #define DWC3_GUCTL1_IP_GAP_ADD_ON(n)	(n << 21)
@@ -963,6 +965,8 @@ struct dwc3_scratchpad_array {
  *			change quirk.
  * @dis_tx_ipgap_linecheck_quirk: set if we disable u2mac linestate
  *			check during HS transmit.
+ * @parkmode_disable_ss_quirk: set if we need to disable all SuperSpeed
+ *			instances in park mode.
  * @tx_de_emphasis_quirk: set if we enable Tx de-emphasis quirk
  * @tx_de_emphasis: Tx de-emphasis value
  * 	0	- -6dB de-emphasis
@@ -992,6 +996,8 @@ struct dwc3_scratchpad_array {
  * @bh_completion_time: time taken for taklet completion
  * @bh_handled_evt_cnt: no. of events handled by tasklet per interrupt
  * @bh_dbg_index: index for capturing bh_completion_time and bh_handled_evt_cnt
+ * @last_run_stop: timestamp denoting the last run_stop update
+ * @num_gsi_eps: number of GSI based hardware accelerated endpoints
  */
 struct dwc3 {
 	struct work_struct	drd_work;
@@ -1154,6 +1160,7 @@ struct dwc3 {
 	unsigned		dis_u2_freeclk_exists_quirk:1;
 	unsigned		dis_del_phy_power_chg_quirk:1;
 	unsigned		dis_tx_ipgap_linecheck_quirk:1;
+	unsigned		parkmode_disable_ss_quirk:1;
 
 	unsigned		tx_de_emphasis_quirk:1;
 	unsigned		ssp_u3_u0_quirk:1;
@@ -1180,6 +1187,7 @@ struct dwc3 {
 
 	unsigned int		index;
 	void			*dwc_ipc_log_ctxt;
+	void			*dwc_dma_ipc_log_ctxt;
 	struct dwc3_gadget_events	dbg_gadget_events;
 	u32			xhci_imod_value;
 	int			core_id;
@@ -1202,11 +1210,16 @@ struct dwc3 {
 	/* Indicate if software connect was issued by the usb_gadget_driver */
 	unsigned int		softconnect:1;
 	/*
-	 * If true, PM suspend allowed irrespective of host runtimePM state
-	 * and core will power collapse. This also leads to reset-resume of
-	 * connected devices on PM resume.
+	 * If true, PM suspend/freeze allowed irrespective of host runtimePM
+	 * state. In PM suspend/resume case, core will stay powered and
+	 * connected devices will just be suspended/resumed.
+	 * In hibernation, core will power collapse and connected devices will
+	 * reset-resume on PM restore.
 	 */
-	bool			host_poweroff_in_pm_suspend;
+	bool			ignore_wakeup_src_in_hostmode;
+	int			retries_on_error;
+	ktime_t			last_run_stop;
+	u32			num_gsi_eps;
 };
 
 #define work_to_dwc(w)		(container_of((w), struct dwc3, drd_work))

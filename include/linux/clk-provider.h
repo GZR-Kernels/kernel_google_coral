@@ -312,7 +312,6 @@ struct regulator;
  * @level_votes: array of votes for each level
  * @num_levels: specifies the size of level_votes array
  * @skip_handoff: do not vote for the max possible voltage during init
- * @use_max_uV: use INT_MAX for max_uV when calling regulator_set_voltage
  * @cur_level: the currently set voltage level
  * @lock: lock to protect this struct
  */
@@ -325,7 +324,6 @@ struct clk_vdd_class {
 	int *level_votes;
 	int num_levels;
 	bool skip_handoff;
-	bool use_max_uV;
 	unsigned long cur_level;
 	struct mutex lock;
 };
@@ -1073,6 +1071,12 @@ static inline void clk_writel(u32 val, u32 __iomem *reg)
 struct dentry *clk_debugfs_add_file(struct clk_hw *hw, char *name, umode_t mode,
 				void *data, const struct file_operations *fops);
 #endif
+#else
+struct of_device_id;
+
+static inline void __init of_clk_init(const struct of_device_id *matches)
+{
+}
 
 #endif /* CONFIG_COMMON_CLK */
 #endif /* CLK_PROVIDER_H */

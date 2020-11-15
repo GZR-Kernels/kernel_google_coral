@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -42,8 +42,6 @@ struct hwevent_drvdata {
 	struct regulator			**hreg;
 	int					nr_hmux;
 	struct hwevent_mux			*hmux;
-	struct coresight_csr			*csr;
-	const char				*csr_name;
 };
 
 static int hwevent_enable(struct hwevent_drvdata *drvdata)
@@ -134,7 +132,7 @@ static ssize_t hwevent_store_setreg(struct device *dev,
 	}
 
 	if (i == drvdata->nr_hmux) {
-		ret = coresight_csr_hwctrl_set(drvdata->csr, addr,  val);
+		ret = coresight_csr_hwctrl_set(addr, val);
 		if (ret) {
 			dev_err(dev, "invalid mux control register address\n");
 			ret = -EINVAL;
@@ -187,22 +185,10 @@ static int hwevent_probe(struct platform_device *pdev)
 	drvdata->dev = &pdev->dev;
 	platform_set_drvdata(pdev, drvdata);
 
-	ret = of_get_coresight_csr_name(dev->of_node, &drvdata->csr_name);
-	if (ret) {
-		dev_err(dev, "No csr data\n");
-	} else{
-		drvdata->csr = coresight_csr_get(drvdata->csr_name);
-		if (IS_ERR(drvdata->csr)) {
-			dev_dbg(dev, "failed to get csr, defer probe\n");
-			return -EPROBE_DEFER;
-		}
-	}
-
 	drvdata->nr_hmux = of_property_count_strings(pdev->dev.of_node,
 						     "reg-names");
-
-	if (!drvdata->nr_hmux)
-		return -ENODEV;
+	if (drvdata->nr_hmux < 0)
+		drvdata->nr_hmux = 0;
 
 	if (drvdata->nr_hmux > 0) {
 		drvdata->hmux = devm_kzalloc(dev, drvdata->nr_hmux *
@@ -223,8 +209,6 @@ static int hwevent_probe(struct platform_device *pdev)
 			drvdata->hmux[i].start = res->start;
 			drvdata->hmux[i].end = res->end;
 		}
-	} else {
-		return drvdata->nr_hmux;
 	}
 
 	mutex_init(&drvdata->mutex);

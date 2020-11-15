@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -382,6 +382,7 @@ struct ufs_qcom_host {
 	struct work_struct ice_cfg_work;
 	struct request *req_pending;
 	struct ufs_vreg *vddp_ref_clk;
+	struct ufs_vreg *vccq_parent;
 	bool work_pending;
 };
 
@@ -422,5 +423,8 @@ static inline bool ufs_qcom_cap_svs2(struct ufs_qcom_host *host)
 {
 	return !!(host->caps & UFS_QCOM_CAP_SVS2);
 }
+
+void ufs_qcom_print_phy_state(struct ufs_hba *hba);
+bool ufs_qcom_check_phy_state(struct ufs_hba *hba);
 
 #endif /* UFS_QCOM_H_ */

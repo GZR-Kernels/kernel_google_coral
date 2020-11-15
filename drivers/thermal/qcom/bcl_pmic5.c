@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -31,7 +31,7 @@
 
 #define BCL_DRIVER_NAME       "bcl_pmic5"
 #define BCL_MONITOR_EN        0x46
-#define BCL_IRQ_STATUS        0x09
+#define BCL_IRQ_STATUS 0x09
 
 #define BCL_IBAT_HIGH         0x4B
 #define BCL_IBAT_TOO_HIGH     0x4C
@@ -44,12 +44,12 @@
 #define BCL_VBAT_COMP_LOW     0x49
 #define BCL_VBAT_COMP_TLOW    0x4A
 
-#define BCL_IRQ_VCMP_L0       0x1
-#define BCL_IRQ_VCMP_L1       0x2
-#define BCL_IRQ_VCMP_L2       0x4
-#define BCL_IRQ_IBAT_L0       0x10
-#define BCL_IRQ_IBAT_L1       0x20
-#define BCL_IRQ_IBAT_L2       0x40
+#define BCL_IRQ_VCMP_L0 0x1
+#define BCL_IRQ_VCMP_L1 0x2
+#define BCL_IRQ_VCMP_L2 0x4
+#define BCL_IRQ_IBAT_L0 0x10
+#define BCL_IRQ_IBAT_L1 0x20
+#define BCL_IRQ_IBAT_L2 0x40
 
 #define BCL_VBAT_SCALING_UV   49827
 #define BCL_VBAT_NO_READING   127
@@ -80,6 +80,7 @@ struct bcl_device;
 
 struct bcl_peripheral_data {
 	int                     irq_num;
+	int                     status_bit_idx;
 	long int		trip_thresh;
 	int                     last_val;
 	struct mutex            state_trans_lock;
@@ -102,6 +103,7 @@ struct bcl_device {
 
 static struct bcl_device *bcl_devices[MAX_PERPH_COUNT];
 static int bcl_device_ct;
+static bool ibat_use_qg_adc;
 
 static int bcl_read_register(struct bcl_device *bcl_perph, int16_t reg_offset,
 				unsigned int *data)
@@ -174,12 +176,20 @@ static void convert_ibat_to_adc_val(int *val)
 	 * Threshold register is bit shifted from ADC MSB.
 	 * So the scaling factor is half.
 	 */
-	*val = (*val * 2000) / BCL_IBAT_SCALING_UA;
+	if (ibat_use_qg_adc)
+		*val = (int)div_s64(*val * 2000 * 2, BCL_IBAT_SCALING_UA);
+	else
+		*val = (int)div_s64(*val * 2000, BCL_IBAT_SCALING_UA);
+
 }
 
 static void convert_adc_to_ibat_val(int *val)
 {
-	*val = (*val * BCL_IBAT_SCALING_UA) / 1000;
+	/* Scaling factor will be half if ibat_use_qg_adc is true */
+	if (ibat_use_qg_adc)
+		*val = (int)div_s64(*val * BCL_IBAT_SCALING_UA, 2 * 1000);
+	else
+		*val = (int)div_s64(*val * BCL_IBAT_SCALING_UA, 1000);
 }
 
 static int bcl_set_ibat(void *data, int low, int high)
@@ -384,7 +394,7 @@ static irqreturn_t bcl_handle_irq(int irq, void *data)
 	struct bcl_peripheral_data *perph_data =
 		(struct bcl_peripheral_data *)data;
 	unsigned int irq_status = 0;
-	int ret, i;
+	int ret;
 	bool notify = false;
 	struct bcl_device *bcl_perph;
 
@@ -404,21 +414,18 @@ static irqreturn_t bcl_handle_irq(int irq, void *data)
 		perph_data->irq_enabled = false;
 		return IRQ_HANDLED;
 	}
-	pr_debug("Irq:%d triggered for bcl type:%d. status:%u\n",
-			irq, perph_data->type, irq_status);
+	pr_debug("Irq:%d triggered for bcl type:%d. status:%u\n", irq,
+		 perph_data->type, irq_status);
 	switch (perph_data->type) {
 	case BCL_VBAT_LVL0: /* BCL L0 interrupt */
 		if ((irq_status & BCL_IRQ_VCMP_L0) &&
-		       (bcl_perph->param[BCL_VBAT_LVL0].tz_dev)) {
+		    (bcl_perph->param[BCL_VBAT_LVL0].tz_dev)) {
 			of_thermal_handle_trip(
 				bcl_perph->param[BCL_VBAT_LVL0].tz_dev);
-			for (i = 0; i < bcl_perph->num_count; i++)
-				of_thermal_handle_trip(
-					bcl_perph->virtual_tz_dev[i]);
 			notify = true;
 		}
 		if ((irq_status & BCL_IRQ_IBAT_L0) &&
-			(bcl_perph->param[BCL_IBAT_LVL0].tz_dev)) {
+		    (bcl_perph->param[BCL_IBAT_LVL0].tz_dev)) {
 			of_thermal_handle_trip(
 				bcl_perph->param[BCL_IBAT_LVL0].tz_dev);
 			notify = true;
@@ -426,7 +433,7 @@ static irqreturn_t bcl_handle_irq(int irq, void *data)
 		break;
 	case BCL_VBAT_LVL1: /* BCL L1 interrupt */
 		if ((irq_status & BCL_IRQ_VCMP_L1) &&
-			(bcl_perph->param[BCL_VBAT_LVL1].tz_dev)) {
+		    (bcl_perph->param[BCL_VBAT_LVL1].tz_dev)) {
 			of_thermal_handle_trip(
 				bcl_perph->param[BCL_VBAT_LVL1].tz_dev);
 
@@ -436,13 +443,13 @@ static irqreturn_t bcl_handle_irq(int irq, void *data)
 			 * those case.
 			 */
 			if (!(irq_status & BCL_IRQ_VCMP_L0) &&
-				(bcl_perph->param[BCL_VBAT_LVL0].tz_dev))
+			    (bcl_perph->param[BCL_VBAT_LVL0].tz_dev))
 				of_thermal_handle_trip(
 					bcl_perph->param[BCL_VBAT_LVL0].tz_dev);
 			notify = true;
 		}
 		if ((irq_status & BCL_IRQ_IBAT_L1) &&
-			(bcl_perph->param[BCL_IBAT_LVL1].tz_dev)) {
+		    (bcl_perph->param[BCL_IBAT_LVL1].tz_dev)) {
 			of_thermal_handle_trip(
 				bcl_perph->param[BCL_IBAT_LVL1].tz_dev);
 
@@ -452,7 +459,7 @@ static irqreturn_t bcl_handle_irq(int irq, void *data)
 			 * those case.
 			 */
 			if (!(irq_status & BCL_IRQ_IBAT_L0) &&
-				(bcl_perph->param[BCL_IBAT_LVL0].tz_dev))
+			    (bcl_perph->param[BCL_IBAT_LVL0].tz_dev))
 				of_thermal_handle_trip(
 					bcl_perph->param[BCL_IBAT_LVL0].tz_dev);
 			notify = true;
@@ -460,7 +467,7 @@ static irqreturn_t bcl_handle_irq(int irq, void *data)
 		break;
 	case BCL_VBAT_LVL2: /* BCL L2 interrupt */
 		if ((irq_status & BCL_IRQ_VCMP_L2) &&
-			(bcl_perph->param[BCL_VBAT_LVL2].tz_dev)) {
+		    (bcl_perph->param[BCL_VBAT_LVL2].tz_dev)) {
 			of_thermal_handle_trip(
 				bcl_perph->param[BCL_VBAT_LVL2].tz_dev);
 
@@ -470,25 +477,35 @@ static irqreturn_t bcl_handle_irq(int irq, void *data)
 			 * in those case.
 			 */
 			if (!(irq_status & BCL_IRQ_VCMP_L1) &&
-				(bcl_perph->param[BCL_VBAT_LVL1].tz_dev))
+			    (bcl_perph->param[BCL_VBAT_LVL1].tz_dev))
 				of_thermal_handle_trip(
 					bcl_perph->param[BCL_VBAT_LVL1].tz_dev);
 			if (!(irq_status & BCL_IRQ_VCMP_L0) &&
-				(bcl_perph->param[BCL_VBAT_LVL0].tz_dev))
+			    (bcl_perph->param[BCL_VBAT_LVL0].tz_dev))
 				of_thermal_handle_trip(
 					bcl_perph->param[BCL_VBAT_LVL0].tz_dev);
 			notify = true;
 		}
 		break;
 	default:
-		pr_err("Invalid type%d for interrupt:%d\n",
-				perph_data->type, irq);
+		pr_err("Invalid type%d for interrupt:%d\n", perph_data->type,
+		       irq);
 		break;
 	}
 	if (!notify)
-		pr_err_ratelimited("Irq:%d triggered. status:%u\n",
-					irq, irq_status);
+		pr_err_ratelimited("Irq:%d triggered. status:%u\n", irq,
+				   irq_status);
 
+	bcl_perph = perph_data->dev;
+	bcl_read_register(bcl_perph, BCL_IRQ_STATUS, &irq_status);
+
+	if (irq_status & perph_data->status_bit_idx) {
+		pr_debug("Irq:%d triggered for bcl type:%s. status:%u\n",
+			irq, bcl_int_names[perph_data->type],
+			irq_status);
+		of_thermal_handle_trip_temp(perph_data->tz_dev,
+				perph_data->status_bit_idx);
+	}
 	return IRQ_HANDLED;
 
 exit_intr:
@@ -614,6 +631,9 @@ static int bcl_get_devicetree_data(struct platform_device *pdev,
 		return -ENODEV;
 	}
 
+	ibat_use_qg_adc =  of_property_read_bool(dev_node,
+				"qcom,ibat-use-qg-adc-5a");
+
 	return ret;
 }
 
@@ -700,19 +720,17 @@ static void bcl_ibat_init(struct platform_device *pdev,
 	switch (type) {
 	case BCL_IBAT_LVL0:
 		if (!bcl_perph->param[BCL_VBAT_LVL0].irq_num ||
-			ibat->irq_num !=
-			bcl_perph->param[BCL_VBAT_LVL0].irq_num) {
-			pr_err("ibat[%d]: irq %d mismatch\n",
-				type, ibat->irq_num);
+		    ibat->irq_num != bcl_perph->param[BCL_VBAT_LVL0].irq_num) {
+			pr_err("ibat[%d]: irq %d mismatch\n", type,
+			       ibat->irq_num);
 			return;
 		}
 		break;
 	case BCL_IBAT_LVL1:
 		if (!bcl_perph->param[BCL_VBAT_LVL1].irq_num ||
-			ibat->irq_num !=
-			bcl_perph->param[BCL_VBAT_LVL1].irq_num) {
-			pr_err("ibat[%d]: irq %d mismatch\n",
-				type, ibat->irq_num);
+		    ibat->irq_num != bcl_perph->param[BCL_VBAT_LVL1].irq_num) {
+			pr_err("ibat[%d]: irq %d mismatch\n", type,
+			       ibat->irq_num);
 			return;
 		}
 		break;

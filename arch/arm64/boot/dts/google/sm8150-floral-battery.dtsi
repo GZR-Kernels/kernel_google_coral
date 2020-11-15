@@ -32,6 +32,7 @@
 	google,batt_psy_disable;
 	qcom,hvdcp-disable;
 	google,usb-port-tz-name = "usbc-therm-adc";
+	google,wdog_snarl_disable;
 	qcom,dc-icl-ua = <1100000>;
 
 	qcom,chgr@1000 {
@@ -79,8 +80,6 @@
 	/* check for NV integrity */
 	maxim,enable-nv-check;
 
-	/* read resistorID from the charger */
-	maxim,bat-power-supply = "charger";
 	maxim,batt-id-range-pct = <15>;
 
 	maxim,nconvgcfg-temp-hysteresis = <10>;
@@ -102,6 +101,8 @@
 		3200 3210 3220 3260
 		3200 3200 3210 3250
 		3200 3200 3200 3250>;
+
+	maxim,capacity-filtercfg = <0x0eb4>;
 };
 
 &spmi_bus {
@@ -165,15 +166,14 @@
 		google,update-interval = <30000>;
 		/* IRDrop Compensation */
 		google,fv-uv-resolution = <25000>;
-		google,cv-range-accuracy = <10000>;
 		google,fv-uv-margin-dpct = <1020>;
 		/* tier switch */
+		google,cv-range-accuracy = <10000>;
+		google,cv-otv-margin = <12000>;
 		google,cv-debounce-cnt = <3>;
-		google,cv-tier-ov-cnt = <10>;
+		google,cv-tier-ov-cnt = <1>;
 		google,cv-tier-switch-cnt = <3>;
-		/* experimental */
-		google,cv-otv-margin = <0>;
-		#thermal-sensor-cells = <0>;
+		/* charging stats */
 		google,chg-stats-qual-time = <900>;
 		google,chg-stats-delta-soc = <15>;
 		/* resistance estimation */
@@ -183,6 +183,13 @@
 		google,res-filt-length = <10>;
 		/* enable cycle counts */
 		google,cycle-counts;
+		/* rest charging */
+		google,chg-rest-rate = <5>;
+		google,chg-rest-soc = <80>;
+		/* battery high temperature update threshold */
+		google,update-high-temp-threshold = <550>;
+
+		#thermal-sensor-cells = <0>;
 	};
 
 	google_charger: google,charger {
@@ -203,6 +210,8 @@
 		google,chg-cc-tolerance = <25>;
 
 		google,pps-cc-tolerance-pct = <5>;
+		google,pps-awake;
+		google,usbc-connector = <&usb_con>;
 	};
 
 	google_wlc_charger: google,wlc_charger {
@@ -216,7 +225,11 @@
 		google,polling-freq = <3>;
 		#cooling-cells = <2>;
 	};
-};
 
+	google_bms {
+		google,gbms-providers = "pmic";
+	};
+
+};
 
 /* FIXME: bcl sensor */

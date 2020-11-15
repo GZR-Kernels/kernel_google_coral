@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2019, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -181,6 +181,9 @@ static void a5xx_platform_setup(struct adreno_device *adreno_dev)
 	/* Setup defaults that might get changed by the fuse bits */
 	adreno_dev->lm_leakage = A530_DEFAULT_LEAKAGE;
 	adreno_dev->speed_bin = 0;
+
+	if (ADRENO_FEATURE(adreno_dev, ADRENO_SPTP_PC))
+		set_bit(ADRENO_SPTP_PC_CTRL, &adreno_dev->pwrctrl_flag);
 
 	/* Check efuse bits for various capabilties */
 	a5xx_check_features(adreno_dev);
@@ -2148,12 +2151,15 @@ static int a5xx_post_start(struct adreno_device *adreno_dev)
 		*cmds++ = 0xF;
 	}
 
-	if (adreno_is_preemption_enabled(adreno_dev))
+	if (adreno_is_preemption_enabled(adreno_dev)) {
 		cmds += _preemption_init(adreno_dev, rb, cmds, NULL);
+		rb->_wptr = rb->_wptr - (42 - (cmds - start));
+		ret = adreno_ringbuffer_submit_spin_nosync(rb, NULL, 2000);
+	} else {
+		rb->_wptr = rb->_wptr - (42 - (cmds - start));
+		ret = adreno_ringbuffer_submit_spin(rb, NULL, 2000);
+	}
 
-	rb->_wptr = rb->_wptr - (42 - (cmds - start));
-
-	ret = adreno_ringbuffer_submit_spin(rb, NULL, 2000);
 	if (ret)
 		adreno_spin_idle_debug(adreno_dev,
 				"hw initialization failed to idle\n");
@@ -2186,11 +2192,11 @@ static int a5xx_gpmu_init(struct adreno_device *adreno_dev)
  */
 static int a5xx_microcode_load(struct adreno_device *adreno_dev)
 {
-	void *ptr;
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	struct adreno_firmware *pm4_fw = ADRENO_FW(adreno_dev, ADRENO_FW_PM4);
 	struct adreno_firmware *pfp_fw = ADRENO_FW(adreno_dev, ADRENO_FW_PFP);
 	uint64_t gpuaddr;
+	int ret = 0;
 
 	gpuaddr = pm4_fw->memdesc.gpuaddr;
 	kgsl_regwrite(device, A5XX_CP_PM4_INSTR_BASE_LO,
@@ -2216,9 +2222,8 @@ static int a5xx_microcode_load(struct adreno_device *adreno_dev)
 	 * appropriate register,
 	 * skip if retention is supported for the CPZ register
 	 */
-	if (adreno_dev->zap_loaded && !(ADRENO_FEATURE(adreno_dev,
+	if (adreno_dev->zap_handle_ptr && !(ADRENO_FEATURE(adreno_dev,
 		ADRENO_CPZ_RETENTION))) {
-		int ret;
 		struct scm_desc desc = {0};
 
 		desc.args[0] = 0;
@@ -2234,16 +2239,27 @@ static int a5xx_microcode_load(struct adreno_device *adreno_dev)
 	}
 
 	/* Load the zap shader firmware through PIL if its available */
-	if (adreno_dev->gpucore->zap_name && !adreno_dev->zap_loaded) {
-		ptr = subsystem_get(adreno_dev->gpucore->zap_name);
+	if (adreno_dev->gpucore->zap_name && !adreno_dev->zap_handle_ptr) {
+		adreno_dev->zap_handle_ptr =
+				subsystem_get(adreno_dev->gpucore->zap_name);
 
 		/* Return error if the zap shader cannot be loaded */
-		if (IS_ERR_OR_NULL(ptr))
-			return (ptr == NULL) ? -ENODEV : PTR_ERR(ptr);
-		adreno_dev->zap_loaded = 1;
+		if (IS_ERR_OR_NULL(adreno_dev->zap_handle_ptr)) {
+			ret = (adreno_dev->zap_handle_ptr == NULL) ?
+				-ENODEV : PTR_ERR(adreno_dev->zap_handle_ptr);
+			adreno_dev->zap_handle_ptr = NULL;
+		}
 	}
 
-	return 0;
+	return ret;
+}
+
+static void a5xx_zap_shader_unload(struct adreno_device *adreno_dev)
+{
+	if (!IS_ERR_OR_NULL(adreno_dev->zap_handle_ptr)) {
+		subsystem_put(adreno_dev->zap_handle_ptr);
+		adreno_dev->zap_handle_ptr = NULL;
+	}
 }
 
 static int _me_init_ucode_workarounds(struct adreno_device *adreno_dev)
@@ -2480,7 +2496,7 @@ static int _load_firmware(struct kgsl_device *device, const char *fwfile,
 
 	memcpy(firmware->memdesc.hostptr, &fw->data[4], fw->size - 4);
 	firmware->size = (fw->size - 4) / sizeof(uint32_t);
-	firmware->version = *(unsigned int *)&fw->data[4];
+	firmware->version = adreno_get_ucode_version((u32 *)fw->data);
 
 done:
 	release_firmware(fw);
@@ -3632,8 +3648,10 @@ struct adreno_gpudev adreno_a5xx_gpudev = {
 	.preemption_post_ibsubmit =
 			a5xx_preemption_post_ibsubmit,
 	.preemption_init = a5xx_preemption_init,
+	.preemption_close = a5xx_preemption_close,
 	.preemption_schedule = a5xx_preemption_schedule,
 	.enable_64bit = a5xx_enable_64bit,
 	.clk_set_options = a5xx_clk_set_options,
 	.snapshot_preemption = a5xx_snapshot_preemption,
+	.zap_shader_unload = a5xx_zap_shader_unload,
 };

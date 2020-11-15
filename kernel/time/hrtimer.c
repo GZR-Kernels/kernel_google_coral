@@ -916,7 +916,6 @@ static void __remove_hrtimer(struct hrtimer *timer,
 	if (reprogram && timer == cpu_base->next_timer)
 		hrtimer_force_reprogram(cpu_base, 1);
 #endif
-
 }
 
 /*

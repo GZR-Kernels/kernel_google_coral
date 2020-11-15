@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -512,8 +512,7 @@ static struct clk_rcg2 gcc_pcie_0_aux_clk_src = {
 		.vdd_class = &vdd_cx,
 		.num_rate_max = VDD_NUM,
 		.rate_max = (unsigned long[VDD_NUM]) {
-			[VDD_MIN] = 9600000,
-			[VDD_LOW] = 19200000},
+			[VDD_MIN] = 19200000},
 	},
 };
 
@@ -532,8 +531,7 @@ static struct clk_rcg2 gcc_pcie_1_aux_clk_src = {
 		.vdd_class = &vdd_cx,
 		.num_rate_max = VDD_NUM,
 		.rate_max = (unsigned long[VDD_NUM]) {
-			[VDD_MIN] = 9600000,
-			[VDD_LOW] = 19200000},
+			[VDD_MIN] = 19200000},
 	},
 };
 
@@ -4161,6 +4159,8 @@ static const struct qcom_reset_map gcc_sm8150_resets[] = {
 	[GCC_USB30_SEC_BCR] = { 0x10000 },
 	[GCC_USB_PHY_CFG_AHB2PHY_BCR] = { 0x6a000 },
 	[GCC_VIDEO_AXIC_CLK_BCR] = { 0xb02c, 2 },
+	[GCC_VIDEO_AXI0_CLK_BCR] = { 0xb024, 2 },
+	[GCC_VIDEO_AXI1_CLK_BCR] = { 0xb028, 2 },
 };
 
 
@@ -4187,6 +4187,26 @@ static struct clk_dfs gcc_dfs_clocks[] = {
 	{ &gcc_qupv3_wrap2_s5_clk_src, DFS_ENABLE_RCG },
 };
 
+static struct clk_regmap *gcc_sm8150_critical_clocks[] = {
+	&gcc_camera_ahb_clk.clkr,
+	&gcc_camera_xo_clk.clkr,
+	&gcc_cpuss_ahb_clk.clkr,
+	&gcc_cpuss_dvm_bus_clk.clkr,
+	&gcc_cpuss_gnoc_clk.clkr,
+	&gcc_disp_ahb_clk.clkr,
+	&gcc_disp_xo_clk.clkr,
+	&gcc_gpu_cfg_ahb_clk.clkr,
+	&gcc_npu_cfg_ahb_clk.clkr,
+	&gcc_sys_noc_cpuss_ahb_clk.clkr,
+	&gcc_video_ahb_clk.clkr,
+	&gcc_video_xo_clk.clkr
+};
+
+static const struct qcom_cc_critical_desc gcc_sm8150_critical_desc = {
+	.clks = gcc_sm8150_critical_clocks,
+	.num_clks = ARRAY_SIZE(gcc_sm8150_critical_clocks),
+};
+
 static const struct qcom_cc_dfs_desc gcc_sm8150_dfs_desc = {
 	.clks = gcc_dfs_clocks,
 	.num_clks = ARRAY_SIZE(gcc_dfs_clocks),
@@ -4211,9 +4231,21 @@ static const struct qcom_cc_desc gcc_sm8150_desc = {
 static const struct of_device_id gcc_sm8150_match_table[] = {
 	{ .compatible = "qcom,gcc-sm8150" },
 	{ .compatible = "qcom,gcc-sm8150-v2" },
+	{ .compatible = "qcom,gcc-sa8155" },
+	{ .compatible = "qcom,gcc-sa8155-v2" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, gcc_sm8150_match_table);
+
+static int gcc_sa8150_resume(struct device *dev)
+{
+	return qcom_cc_enable_critical_clks(&gcc_sm8150_critical_desc);
+}
+
+static const struct dev_pm_ops gcc_sa8150_pm_ops = {
+	.restore_early = gcc_sa8150_resume,
+	.thaw_early = gcc_sa8150_resume,
+};
 
 static void gcc_sm8150_fixup_sm8150v2(struct regmap *regmap)
 {
@@ -4234,8 +4266,13 @@ static int gcc_sm8150_fixup(struct platform_device *pdev, struct regmap *regmap)
 	if (!compat || (compatlen <= 0))
 		return -EINVAL;
 
-	if (!strcmp(compat, "qcom,gcc-sm8150-v2"))
+	if (!strcmp(compat, "qcom,gcc-sm8150-v2") ||
+			!strcmp(compat, "qcom,gcc-sa8155-v2"))
 		gcc_sm8150_fixup_sm8150v2(regmap);
+
+	if (!strcmp(compat, "qcom,gcc-sa8155") ||
+			!strcmp(compat, "qcom,gcc-sa8155-v2"))
+		pdev->dev.driver->pm = &gcc_sa8150_pm_ops;
 
 	return 0;
 }
@@ -4260,7 +4297,6 @@ static int gcc_sm8150_probe(struct platform_device *pdev)
 			dev_err(&pdev->dev, "Unable to get vdd_mm regulator\n");
 		return PTR_ERR(vdd_mm.regulator[0]);
 	}
-	vdd_mm.use_max_uV = true;
 
 	/* register hardware clocks */
 	for (i = 0; i < ARRAY_SIZE(gcc_sm8150_hws); i++) {

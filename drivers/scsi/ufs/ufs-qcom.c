@@ -771,13 +771,14 @@ static int ufs_qcom_config_vreg(struct device *dev,
 		ret = regulator_set_load(vreg->reg, uA_load);
 		if (ret)
 			goto out;
-
-		min_uV = on ? vreg->min_uV : 0;
-		ret = regulator_set_voltage(reg, min_uV, vreg->max_uV);
-		if (ret) {
-			dev_err(dev, "%s: %s set voltage failed, err=%d\n",
+		if (vreg->min_uV && vreg->max_uV) {
+			min_uV = on ? vreg->min_uV : 0;
+			ret = regulator_set_voltage(reg, min_uV, vreg->max_uV);
+			if (ret) {
+				dev_err(dev, "%s: %s failed, err=%d\n",
 					__func__, vreg->name, ret);
-			goto out;
+				goto out;
+			}
 		}
 	}
 out:
@@ -842,6 +843,10 @@ static int ufs_qcom_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 		if (host->vddp_ref_clk && ufs_qcom_is_link_off(hba))
 			ret = ufs_qcom_disable_vreg(hba->dev,
 					host->vddp_ref_clk);
+		if (host->vccq_parent && !hba->auto_bkops_enabled)
+			ufs_qcom_config_vreg(hba->dev,
+					host->vccq_parent, false);
+
 		ufs_qcom_ice_suspend(host);
 		if (ufs_qcom_is_link_off(hba)) {
 			/* Assert PHY soft reset */
@@ -873,6 +878,8 @@ static int ufs_qcom_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 				   hba->spm_lvl > UFS_PM_LVL_3))
 		ufs_qcom_enable_vreg(hba->dev,
 				      host->vddp_ref_clk);
+	if (host->vccq_parent)
+		ufs_qcom_config_vreg(hba->dev, host->vccq_parent, true);
 
 	err = ufs_qcom_enable_lane_clks(host);
 	if (err)
@@ -965,7 +972,9 @@ int ufs_qcom_crytpo_engine_cfg_start(struct ufs_hba *hba, unsigned int task_tag)
 	int err = 0;
 
 	if (!host->ice.pdev ||
-	    !lrbp->cmd || lrbp->command_type != UTP_CMD_TYPE_SCSI)
+	    !lrbp->cmd ||
+		(lrbp->command_type != UTP_CMD_TYPE_SCSI &&
+		 lrbp->command_type != UTP_CMD_TYPE_UFS_STORAGE))
 		goto out;
 
 	err = ufs_qcom_ice_cfg_start(host, lrbp->cmd);
@@ -980,7 +989,8 @@ int ufs_qcom_crytpo_engine_cfg_end(struct ufs_hba *hba,
 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
 	int err = 0;
 
-	if (!host->ice.pdev || lrbp->command_type != UTP_CMD_TYPE_SCSI)
+	if (!host->ice.pdev || (lrbp->command_type != UTP_CMD_TYPE_SCSI &&
+		lrbp->command_type != UTP_CMD_TYPE_UFS_STORAGE))
 		goto out;
 
 	err = ufs_qcom_ice_cfg_end(host, req);
@@ -1011,12 +1021,27 @@ static int ufs_qcom_crypto_engine_get_status(struct ufs_hba *hba, u32 *status)
 
 	return ufs_qcom_ice_get_status(host, status);
 }
+
+static int ufs_qcom_crypto_get_pending_req_status(struct ufs_hba *hba)
+{
+	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+	int err = 0;
+
+	if (!host->ice.pdev)
+		goto out;
+
+	err = ufs_qcom_is_ice_busy(host);
+out:
+	return err;
+}
+
 #else /* !CONFIG_SCSI_UFS_QCOM_ICE */
 #define ufs_qcom_crypto_req_setup		NULL
 #define ufs_qcom_crytpo_engine_cfg_start	NULL
 #define ufs_qcom_crytpo_engine_cfg_end		NULL
 #define ufs_qcom_crytpo_engine_reset		NULL
 #define ufs_qcom_crypto_engine_get_status	NULL
+#define ufs_qcom_crypto_get_pending_req_status	NULL
 #endif /* CONFIG_SCSI_UFS_QCOM_ICE */
 
 struct ufs_qcom_dev_params {
@@ -2104,7 +2129,10 @@ static int ufs_qcom_parse_reg_info(struct ufs_qcom_host *host, char *name,
 	if (ret) {
 		dev_dbg(dev, "%s: unable to find %s err %d, using default\n",
 			__func__, prop_name, ret);
-		vreg->min_uV = VDDP_REF_CLK_MIN_UV;
+		if (!strcmp(name, "qcom,vddp-ref-clk"))
+			vreg->min_uV = VDDP_REF_CLK_MIN_UV;
+		else if (!strcmp(name, "qcom,vccq-parent"))
+			vreg->min_uV = 0;
 		ret = 0;
 	}
 
@@ -2113,7 +2141,10 @@ static int ufs_qcom_parse_reg_info(struct ufs_qcom_host *host, char *name,
 	if (ret) {
 		dev_dbg(dev, "%s: unable to find %s err %d, using default\n",
 			__func__, prop_name, ret);
-		vreg->max_uV = VDDP_REF_CLK_MAX_UV;
+		if (!strcmp(name, "qcom,vddp-ref-clk"))
+			vreg->max_uV = VDDP_REF_CLK_MAX_UV;
+		else if (!strcmp(name, "qcom,vccq-parent"))
+			vreg->max_uV = 0;
 		ret = 0;
 	}
 
@@ -2274,9 +2305,20 @@ static int ufs_qcom_init(struct ufs_hba *hba)
 		}
 	}
 
+	err = ufs_qcom_parse_reg_info(host, "qcom,vccq-parent",
+				      &host->vccq_parent);
+	if (host->vccq_parent) {
+		err = ufs_qcom_config_vreg(hba->dev, host->vccq_parent, true);
+		if (err) {
+			dev_err(dev, "%s: failed vccq-parent set load: %d\n",
+				__func__, err);
+			goto out_disable_vddp;
+		}
+	}
+
 	err = ufs_qcom_init_lane_clks(host);
 	if (err)
-		goto out_disable_vddp;
+		goto out_set_load_vccq_parent;
 
 	ufs_qcom_parse_lpm(host);
 	if (host->disable_lpm)
@@ -2300,6 +2342,9 @@ static int ufs_qcom_init(struct ufs_hba *hba)
 
 	goto out;
 
+out_set_load_vccq_parent:
+	if (host->vccq_parent)
+		ufs_qcom_config_vreg(hba->dev, host->vccq_parent, false);
 out_disable_vddp:
 	if (host->vddp_ref_clk)
 		ufs_qcom_disable_vreg(dev, host->vddp_ref_clk);
@@ -2763,6 +2808,22 @@ static void ufs_qcom_dump_dbg_regs(struct ufs_hba *hba, bool no_sleep)
 	ufs_qcom_ice_print_regs(host);
 }
 
+void ufs_qcom_print_phy_state(struct ufs_hba *hba)
+{
+	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+	struct phy *phy = host->generic_phy;
+
+	ufs_qcom_phy_print_phy_state(phy);
+}
+
+bool ufs_qcom_check_phy_state(struct ufs_hba *hba)
+{
+	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+	struct phy *phy = host->generic_phy;
+
+	return !phy->power_count && !ufs_qcom_phy_ref_clk_enabled(phy);
+}
+
 /**
  * struct ufs_hba_qcom_vops - UFS QCOM specific variant operations
  *
@@ -2797,6 +2858,7 @@ static struct ufs_hba_crypto_variant_ops ufs_hba_crypto_variant_ops = {
 	.crypto_engine_cfg_end	= ufs_qcom_crytpo_engine_cfg_end,
 	.crypto_engine_reset	  = ufs_qcom_crytpo_engine_reset,
 	.crypto_engine_get_status = ufs_qcom_crypto_engine_get_status,
+	.crypto_get_req_status = ufs_qcom_crypto_get_pending_req_status,
 };
 
 static struct ufs_hba_pm_qos_variant_ops ufs_hba_pm_qos_variant_ops = {
@@ -2875,6 +2937,9 @@ static const struct dev_pm_ops ufs_qcom_pm_ops = {
 	.runtime_suspend = ufshcd_pltfrm_runtime_suspend,
 	.runtime_resume  = ufshcd_pltfrm_runtime_resume,
 	.runtime_idle    = ufshcd_pltfrm_runtime_idle,
+	.freeze		= ufshcd_pltfrm_freeze,
+	.restore	= ufshcd_pltfrm_restore,
+	.thaw		= ufshcd_pltfrm_thaw,
 };
 
 static struct platform_driver ufs_qcom_pltform = {
@@ -2885,6 +2950,7 @@ static struct platform_driver ufs_qcom_pltform = {
 		.name	= "ufshcd-qcom",
 		.pm	= &ufs_qcom_pm_ops,
 		.of_match_table = of_match_ptr(ufs_qcom_of_match),
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 };
 module_platform_driver(ufs_qcom_pltform);

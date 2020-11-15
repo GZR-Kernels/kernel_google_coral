@@ -142,6 +142,8 @@ void compute_work_load(struct devfreq_dev_status *stats,
 		struct devfreq_msm_adreno_tz_data *priv,
 		struct devfreq *devfreq)
 {
+	u64 busy;
+
 	spin_lock(&sample_lock);
 	/*
 	 * Keep collecting the stats till the client
@@ -149,8 +151,10 @@ void compute_work_load(struct devfreq_dev_status *stats,
 	 * is done when the entry is read
 	 */
 	acc_total += stats->total_time;
-	acc_relative_busy += (stats->busy_time * stats->current_frequency) /
-				devfreq->profile->freq_table[0];
+	busy = (u64)stats->busy_time * stats->current_frequency;
+	do_div(busy, devfreq->profile->freq_table[0]);
+	acc_relative_busy += busy;
+
 	spin_unlock(&sample_lock);
 }
 
@@ -519,6 +523,37 @@ static int tz_handler(struct devfreq *devfreq, unsigned int event, void *data)
 	return result;
 }
 
+int msm_adreno_devfreq_init_tz(struct devfreq *devfreq)
+{
+	struct devfreq_msm_adreno_tz_data *priv;
+	unsigned int tz_pwrlevels[MSM_ADRENO_MAX_PWRLEVELS + 1];
+	int i, out = 1, ret;
+	unsigned int version;
+
+	if (!devfreq)
+		return -EINVAL;
+
+	priv = devfreq->data;
+
+	if (devfreq->profile->max_state < MSM_ADRENO_MAX_PWRLEVELS) {
+		for (i = 0; i < devfreq->profile->max_state; i++)
+			tz_pwrlevels[out++] = devfreq->profile->freq_table[i];
+		tz_pwrlevels[0] = i;
+	} else {
+		pr_err(TAG "tz_pwrlevels[] is too short\n");
+		return -EINVAL;
+	}
+
+	ret = tz_init(priv, tz_pwrlevels, sizeof(tz_pwrlevels), &version,
+				sizeof(version));
+	if (ret != 0 || version > MAX_TZ_VERSION) {
+		pr_err(TAG "tz_init failed\n");
+		return ret ? ret : -EINVAL;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL(msm_adreno_devfreq_init_tz);
 
 static struct devfreq_governor msm_adreno_tz = {
 	.name = "msm-adreno-tz",

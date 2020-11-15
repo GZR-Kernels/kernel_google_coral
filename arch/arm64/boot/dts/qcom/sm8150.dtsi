@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2019, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -60,6 +60,7 @@
 	aliases {
 		serial0 = &qupv3_se12_2uart;
 		hsuart0 = &qupv3_se13_4uart;
+		hsuart1 = &qupv3_se4_2uart;
 		spi0 = &qupv3_se3_spi;
 		i2c0 = &qupv3_se4_i2c;
 	};
@@ -757,6 +758,7 @@
 
 		dump_mem: mem_dump_region {
 			compatible = "shared-dma-pool";
+			alloc-ranges = <0x0 0x00000000 0x0 0xffffffff>;
 			reusable;
 			size = <0 0x2400000>;
 		};
@@ -1374,14 +1376,20 @@
 		compatible = "qcom,bus-proxy-client";
 		qcom,msm-bus,name = "bus-proxy-client";
 		qcom,msm-bus,num-cases = <2>;
-		qcom,msm-bus,num-paths = <3>;
+		qcom,msm-bus,num-paths = <5>;
 		qcom,msm-bus,vectors-KBps =
 			<MSM_BUS_MASTER_AMPSS_M0 MSM_BUS_SLAVE_DISPLAY_CFG 0 0>,
 			<MSM_BUS_MASTER_AMPSS_M0 MSM_BUS_SLAVE_CAMERA_CFG 0 0>,
 			<MSM_BUS_MASTER_AMPSS_M0 MSM_BUS_SLAVE_VENUS_CFG 0 0>,
+			<MSM_BUS_MASTER_MDP_PORT0 MSM_BUS_SLAVE_EBI_CH0 0 0>,
+			<MSM_BUS_MASTER_MDP_PORT1 MSM_BUS_SLAVE_EBI_CH0 0 0>,
 			<MSM_BUS_MASTER_AMPSS_M0 MSM_BUS_SLAVE_DISPLAY_CFG 0 1>,
 			<MSM_BUS_MASTER_AMPSS_M0 MSM_BUS_SLAVE_CAMERA_CFG 0 1>,
-			<MSM_BUS_MASTER_AMPSS_M0 MSM_BUS_SLAVE_VENUS_CFG 0 1>;
+			<MSM_BUS_MASTER_AMPSS_M0 MSM_BUS_SLAVE_VENUS_CFG 0 1>,
+			<MSM_BUS_MASTER_MDP_PORT0 MSM_BUS_SLAVE_EBI_CH0
+			1500000 1500000>,
+			<MSM_BUS_MASTER_MDP_PORT1 MSM_BUS_SLAVE_EBI_CH0
+			1500000 1500000>;
 		status = "ok";
 	};
 
@@ -4130,6 +4138,7 @@
 
 &gpu_cx_gdsc {
 	parent-supply = <&VDD_CX_LEVEL>;
+	vdd_parent-supply = <&VDD_CX_LEVEL>;
 	status = "ok";
 };
 

@@ -2,7 +2,7 @@
  * drivers/mmc/host/sdhci-msm.c - Qualcomm Technologies, Inc. MSM SDHCI Platform
  * driver source file
  *
- * Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -1996,6 +1996,9 @@ struct sdhci_msm_pltfm_data *sdhci_msm_populate_pdata(struct device *dev,
 	if (!pdata)
 		goto out;
 
+	device_property_read_u32(dev, "post-power-on-delay-ms",
+                                &msm_host->mmc->ios.power_delay_ms);
+
 	pdata->status_gpio = of_get_named_gpio_flags(np, "cd-gpios", 0, &flags);
 	if (gpio_is_valid(pdata->status_gpio) && !(flags & OF_GPIO_ACTIVE_LOW))
 		pdata->caps2 |= MMC_CAP2_CD_ACTIVE_HIGH;
@@ -3121,7 +3124,7 @@ static void sdhci_msm_registers_save(struct sdhci_host *host)
 	msm_host->regs_restore.hc_2c_2e =
 		sdhci_readl(host, SDHCI_CLOCK_CONTROL);
 	msm_host->regs_restore.hc_3c_3e =
-		sdhci_readl(host, SDHCI_ACMD12_ERR);
+		sdhci_readl(host, SDHCI_AUTO_CMD_STATUS);
 	msm_host->regs_restore.vendor_pwrctl_ctl =
 		readl_relaxed(host->ioaddr +
 		msm_host_offset->CORE_PWRCTL_CTL);
@@ -3184,7 +3187,7 @@ static void sdhci_msm_registers_restore(struct sdhci_host *host)
 	sdhci_writel(host, msm_host->regs_restore.hc_2c_2e,
 			SDHCI_CLOCK_CONTROL);
 	sdhci_writel(host, msm_host->regs_restore.hc_3c_3e,
-			SDHCI_ACMD12_ERR);
+			SDHCI_AUTO_CMD_STATUS);
 	sdhci_writel(host, msm_host->regs_restore.hc_38_3a,
 			SDHCI_SIGNAL_ENABLE);
 	sdhci_writel(host, msm_host->regs_restore.hc_34_36,
@@ -5190,6 +5193,13 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 		goto vreg_deinit;
 	}
 
+	/*
+	 * To avoid polling and to avoid this R1b command conversion
+	 * to R1 command if the requested busy timeout > host's max
+	 * busy timeout in case of sanitize, erase or any R1b command
+	 */
+	host->mmc->max_busy_timeout = 0;
+
 	msm_host->pltfm_init_done = true;
 
 	pm_runtime_set_active(&pdev->dev);
@@ -5549,11 +5559,41 @@ static int sdhci_msm_suspend_noirq(struct device *dev)
 	return ret;
 }
 
+static int sdhci_msm_freeze(struct device *dev)
+{
+	struct sdhci_host *host = dev_get_drvdata(dev);
+	struct mmc_host *mmc = host->mmc;
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct sdhci_msm_host *msm_host = pltfm_host->priv;
+
+	if (gpio_is_valid(msm_host->pdata->status_gpio) &&
+			(msm_host->mmc->slot.cd_irq >= 0))
+		mmc_gpiod_free_cd_irq(mmc);
+	return 0;
+}
+
+static int sdhci_msm_restore(struct device *dev)
+{
+	struct sdhci_host *host = dev_get_drvdata(dev);
+	struct mmc_host *mmc = host->mmc;
+
+	if (mmc->inlinecrypt_support)
+		mmc->inlinecrypt_reset_needed = true;
+
+	mmc_gpiod_restore_cd_irq(mmc);
+
+	return 0;
+}
+
 static const struct dev_pm_ops sdhci_msm_pmops = {
-	SET_LATE_SYSTEM_SLEEP_PM_OPS(sdhci_msm_suspend, sdhci_msm_resume)
-	SET_RUNTIME_PM_OPS(sdhci_msm_runtime_suspend, sdhci_msm_runtime_resume,
-			   NULL)
-	.suspend_noirq = sdhci_msm_suspend_noirq,
+	.suspend_late		= sdhci_msm_suspend,
+	.resume_early		= sdhci_msm_resume,
+	.runtime_suspend	= sdhci_msm_runtime_suspend,
+	.runtime_resume		= sdhci_msm_runtime_resume,
+	.suspend_noirq		= sdhci_msm_suspend_noirq,
+	.freeze			= sdhci_msm_freeze,
+	.restore		= sdhci_msm_restore,
+	.thaw			= sdhci_msm_restore,
 };
 
 #define SDHCI_MSM_PMOPS (&sdhci_msm_pmops)

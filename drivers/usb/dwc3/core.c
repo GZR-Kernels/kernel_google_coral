@@ -889,6 +889,9 @@ int dwc3_core_init(struct dwc3 *dwc)
 		if (dwc->dis_tx_ipgap_linecheck_quirk)
 			reg |= DWC3_GUCTL1_TX_IPGAP_LINECHECK_DIS;
 
+		if (dwc->parkmode_disable_ss_quirk)
+			reg |= DWC3_GUCTL1_PARKMODE_DISABLE_SS;
+
 		dwc3_writel(dwc->regs, DWC3_GUCTL1, reg);
 	}
 
@@ -1155,6 +1158,8 @@ static void dwc3_get_properties(struct dwc3 *dwc)
 				"snps,dis-del-phy-power-chg-quirk");
 	dwc->dis_tx_ipgap_linecheck_quirk = device_property_read_bool(dev,
 				"snps,dis-tx-ipgap-linecheck-quirk");
+	dwc->parkmode_disable_ss_quirk = device_property_read_bool(dev,
+				"snps,parkmode-disable-ss-quirk");
 
 	dwc->tx_de_emphasis_quirk = device_property_read_bool(dev,
 				"snps,tx_de_emphasis_quirk");
@@ -1172,6 +1177,7 @@ static void dwc3_get_properties(struct dwc3 *dwc)
 					"snps,usb3-u1u2-disable");
 	dwc->disable_clk_gating = device_property_read_bool(dev,
 					"snps,disable-clk-gating");
+	device_property_read_u32(dev, "num-gsi-eps", &dwc->num_gsi_eps);
 
 	dwc->dis_metastability_quirk = device_property_read_bool(dev,
 				"snps,dis_metastability_quirk");
@@ -1253,6 +1259,7 @@ static int dwc3_probe(struct platform_device *pdev)
 
 	void __iomem		*regs;
 	int			irq;
+	char			dma_ipc_log_ctx_name[40];
 
 	if (count >= DWC_CTRL_COUNT) {
 		dev_err(dev, "Err dwc instance %d >= %d available\n",
@@ -1355,6 +1362,13 @@ static int dwc3_probe(struct platform_device *pdev)
 					dev_name(dwc->dev), 0);
 	if (!dwc->dwc_ipc_log_ctxt)
 		dev_err(dwc->dev, "Error getting ipc_log_ctxt\n");
+
+	snprintf(dma_ipc_log_ctx_name, sizeof(dma_ipc_log_ctx_name),
+					"%s.ep_events", dev_name(dwc->dev));
+	dwc->dwc_dma_ipc_log_ctxt = ipc_log_context_create(NUM_LOG_PAGES,
+						dma_ipc_log_ctx_name, 0);
+	if (!dwc->dwc_dma_ipc_log_ctxt)
+		dev_err(dwc->dev, "Error getting ipc_log_ctxt for ep_events\n");
 
 	dwc3_instance[count] = dwc;
 	dwc->index = count;
@@ -1584,7 +1598,7 @@ static int dwc3_resume(struct device *dev)
 		 * which is now out of LPM. This allows runtime_suspend later.
 		 */
 		if (dwc->current_dr_role == DWC3_GCTL_PRTCAP_HOST &&
-		    dwc->host_poweroff_in_pm_suspend)
+		    dwc->ignore_wakeup_src_in_hostmode)
 			goto runtime_set_active;
 
 		return 0;

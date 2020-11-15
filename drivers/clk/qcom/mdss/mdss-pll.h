@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2019, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -57,6 +57,7 @@ enum {
 
 enum {
 	MDSS_PLL_TARGET_8996,
+	MDSS_PLL_TARGET_SDM660,
 };
 
 #define DFPS_MAX_NUM_OF_FRAME_RATES 16
@@ -212,11 +213,18 @@ struct mdss_pll_vco_calc {
 
 static inline bool is_gdsc_disabled(struct mdss_pll_resources *pll_res)
 {
+	bool ret = false;
 	if (!pll_res->gdsc_base) {
 		WARN(1, "gdsc_base register is not defined\n");
 		return true;
 	}
-	return readl_relaxed(pll_res->gdsc_base) & BIT(31) ? false : true;
+	if (pll_res->target_id == MDSS_PLL_TARGET_SDM660)
+		ret = ((readl_relaxed(pll_res->gdsc_base + 0x4) & BIT(31)) &&
+		(!(readl_relaxed(pll_res->gdsc_base) & BIT(0)))) ? false : true;
+	else
+		ret = readl_relaxed(pll_res->gdsc_base) & BIT(31) ?
+			 false : true;
+	return ret;
 }
 
 static inline int mdss_pll_div_prepare(struct clk_hw *hw)
@@ -250,6 +258,8 @@ void mdss_pll_util_resource_release(struct platform_device *pdev,
 int mdss_pll_util_resource_enable(struct mdss_pll_resources *pll_res,
 								bool enable);
 int mdss_pll_util_resource_parse(struct platform_device *pdev,
+				struct mdss_pll_resources *pll_res);
+void mdss_pll_util_parse_dt_dfps(struct platform_device *pdev,
 				struct mdss_pll_resources *pll_res);
 struct dss_vreg *mdss_pll_get_mp_by_reg_name(struct mdss_pll_resources *pll_res
 		, char *name);

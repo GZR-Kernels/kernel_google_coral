@@ -1,4 +1,4 @@
-/* Copyright (c) 2019, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2019-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -172,7 +172,7 @@
 		clocks = <&clock_aop QDSS_CLK>;
 		clock-names = "apb_pclk";
 
-		interrupts = <GIC_SPI 270 IRQ_TYPE_EDGE_RISING>;
+		interrupts = <GIC_SPI 251 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "byte-cntr-irq";
 
 		port {
@@ -1156,6 +1156,22 @@
 		clocks = <&clock_aop QDSS_CLK>;
 		clock-names = "apb_pclk";
 
+	};
+
+	ipcb_tgu: tgu@6b0c000 {
+		compatible = "arm,primecell";
+		arm,primecell-periphid = <0x000bb999>;
+		reg = <0x06b0c000 0x1000>;
+		reg-names = "tgu-base";
+		tgu-steps = <3>;
+		tgu-conditions = <4>;
+		tgu-regs = <4>;
+		tgu-timer-counters = <8>;
+
+		coresight-name = "coresight-tgu-ipcb";
+
+		clocks = <&clock_aop QDSS_CLK>;
+		clock-names = "apb_pclk";
 	};
 
 	cti0_swao:cti@6b04000 {

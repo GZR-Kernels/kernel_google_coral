@@ -1,4 +1,4 @@
-/* Copyright (c) 2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2018-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -33,6 +33,7 @@ struct firmware_info {
 };
 
 static const struct firmware_info firmware_table[] = {
+	{.dev_id = 0x307, .fw_image = "sdx60m/sbl1.mbn"},
 	{.dev_id = 0x306, .fw_image = "sdx55m/sbl1.mbn"},
 	{.dev_id = 0x305, .fw_image = "sdx50m/sbl1.mbn"},
 	{.dev_id = 0x304, .fw_image = "sbl.mbn", .edl_image = "edl.mbn"},
@@ -79,6 +80,7 @@ void mhi_deinit_pci_dev(struct mhi_controller *mhi_cntrl)
 	pm_runtime_mark_last_busy(&pci_dev->dev);
 	pm_runtime_dont_use_autosuspend(&pci_dev->dev);
 	pm_runtime_disable(&pci_dev->dev);
+
 	pci_free_irq_vectors(pci_dev);
 	kfree(mhi_cntrl->irq);
 	mhi_cntrl->irq = NULL;
@@ -94,7 +96,7 @@ static int mhi_init_pci_dev(struct mhi_controller *mhi_cntrl)
 	struct mhi_dev *mhi_dev = mhi_controller_get_devdata(mhi_cntrl);
 	struct pci_dev *pci_dev = mhi_dev->pci_dev;
 	int ret;
-	resource_size_t start, len;
+	resource_size_t len;
 	int i;
 
 	mhi_dev->resn = MHI_PCI_BAR_NUM;
@@ -118,9 +120,9 @@ static int mhi_init_pci_dev(struct mhi_controller *mhi_cntrl)
 
 	pci_set_master(pci_dev);
 
-	start = pci_resource_start(pci_dev, mhi_dev->resn);
+	mhi_cntrl->base_addr = pci_resource_start(pci_dev, mhi_dev->resn);
 	len = pci_resource_len(pci_dev, mhi_dev->resn);
-	mhi_cntrl->regs = ioremap_nocache(start, len);
+	mhi_cntrl->regs = ioremap_nocache(mhi_cntrl->base_addr, len);
 	if (!mhi_cntrl->regs) {
 		MHI_ERR("Error ioremap region\n");
 		goto error_ioremap;
@@ -210,20 +212,29 @@ static int mhi_runtime_suspend(struct device *dev)
 	}
 
 	ret = mhi_pm_suspend(mhi_cntrl);
+
 	if (ret) {
 		MHI_LOG("Abort due to ret:%d\n", ret);
+		mhi_dev->suspend_mode = MHI_ACTIVE_STATE;
 		goto exit_runtime_suspend;
 	}
 
-	ret = mhi_arch_link_off(mhi_cntrl, true);
-	if (ret)
-		MHI_ERR("Failed to Turn off link ret:%d\n", ret);
+	mhi_dev->suspend_mode = MHI_DEFAULT_SUSPEND;
+
+	ret = mhi_arch_link_suspend(mhi_cntrl);
+
+	/* failed suspending link abort mhi suspend */
+	if (ret) {
+		MHI_LOG("Failed to suspend link, abort suspend\n");
+		mhi_pm_resume(mhi_cntrl);
+		mhi_dev->suspend_mode = MHI_ACTIVE_STATE;
+	}
 
 exit_runtime_suspend:
 	mutex_unlock(&mhi_cntrl->pm_mutex);
 	MHI_LOG("Exited with ret:%d\n", ret);
 
-	return ret;
+	return (ret < 0) ? -EBUSY : 0;
 }
 
 static int mhi_runtime_idle(struct device *dev)
@@ -264,57 +275,144 @@ static int mhi_runtime_resume(struct device *dev)
 	}
 
 	/* turn on link */
-	ret = mhi_arch_link_on(mhi_cntrl);
+	ret = mhi_arch_link_resume(mhi_cntrl);
 	if (ret)
 		goto rpm_resume_exit;
 
-	/* enter M0 state */
-	ret = mhi_pm_resume(mhi_cntrl);
+
+	/* transition to M0 state */
+	if (mhi_dev->suspend_mode == MHI_DEFAULT_SUSPEND)
+		ret = mhi_pm_resume(mhi_cntrl);
+	else
+		ret = mhi_pm_fast_resume(mhi_cntrl, MHI_FAST_LINK_ON);
+
+	mhi_dev->suspend_mode = MHI_ACTIVE_STATE;
 
 rpm_resume_exit:
 	mutex_unlock(&mhi_cntrl->pm_mutex);
 	MHI_LOG("Exited with :%d\n", ret);
 
-	return ret;
+	return (ret < 0) ? -EBUSY : 0;
 }
 
 static int mhi_system_resume(struct device *dev)
 {
-	int ret = 0;
-	struct mhi_controller *mhi_cntrl = dev_get_drvdata(dev);
-
-	ret = mhi_runtime_resume(dev);
-	if (ret) {
-		MHI_ERR("Failed to resume link\n");
-	} else {
-		pm_runtime_set_active(dev);
-		pm_runtime_enable(dev);
-	}
-
-	return ret;
+	return mhi_runtime_resume(dev);
 }
 
 int mhi_system_suspend(struct device *dev)
 {
 	struct mhi_controller *mhi_cntrl = dev_get_drvdata(dev);
+	struct mhi_dev *mhi_dev = mhi_controller_get_devdata(mhi_cntrl);
 	int ret;
 
 	MHI_LOG("Entered\n");
 
-	/* if rpm status still active then force suspend */
-	if (!pm_runtime_status_suspended(dev)) {
-		ret = mhi_runtime_suspend(dev);
-		if (ret) {
-			MHI_LOG("suspend failed ret:%d\n", ret);
-			return ret;
+	mutex_lock(&mhi_cntrl->pm_mutex);
+
+	if (!mhi_dev->powered_on) {
+		MHI_LOG("Not fully powered, return success\n");
+		mutex_unlock(&mhi_cntrl->pm_mutex);
+		return 0;
+	}
+
+	/*
+	 * pci framework always makes a dummy vote to rpm
+	 * framework to resume before calling system suspend
+	 * hence usage count is minimum one
+	 */
+	if (atomic_read(&dev->power.usage_count) > 1) {
+		/*
+		 * clients have requested to keep link on, try
+		 * fast suspend. No need to notify clients since
+		 * we will not be turning off the pcie link
+		 */
+		ret = mhi_pm_fast_suspend(mhi_cntrl, false);
+		mhi_dev->suspend_mode = MHI_FAST_LINK_ON;
+	} else {
+		/* try normal suspend */
+		mhi_dev->suspend_mode = MHI_DEFAULT_SUSPEND;
+		ret = mhi_pm_suspend(mhi_cntrl);
+
+		/*
+		 * normal suspend failed because we're busy, try
+		 * fast suspend before aborting system suspend.
+		 * this could happens if client has disabled
+		 * device lpm but no active vote for PCIe from
+		 * apps processor
+		 */
+		if (ret == -EBUSY) {
+			ret = mhi_pm_fast_suspend(mhi_cntrl, true);
+			mhi_dev->suspend_mode = MHI_FAST_LINK_ON;
 		}
 	}
 
-	pm_runtime_set_suspended(dev);
-	pm_runtime_disable(dev);
+	if (ret) {
+		MHI_LOG("Abort due to ret:%d\n", ret);
+		mhi_dev->suspend_mode = MHI_ACTIVE_STATE;
+		goto exit_system_suspend;
+	}
 
-	MHI_LOG("Exit\n");
-	return 0;
+	ret = mhi_arch_link_suspend(mhi_cntrl);
+
+	/* failed suspending link abort mhi suspend */
+	if (ret) {
+		MHI_LOG("Failed to suspend link, abort suspend\n");
+		if (mhi_dev->suspend_mode == MHI_DEFAULT_SUSPEND)
+			mhi_pm_resume(mhi_cntrl);
+		else
+			mhi_pm_fast_resume(mhi_cntrl, MHI_FAST_LINK_OFF);
+
+		mhi_dev->suspend_mode = MHI_ACTIVE_STATE;
+	}
+
+exit_system_suspend:
+	mutex_unlock(&mhi_cntrl->pm_mutex);
+
+	MHI_LOG("Exit with ret:%d\n", ret);
+
+	return ret;
+}
+
+static int mhi_force_suspend(struct mhi_controller *mhi_cntrl)
+{
+	int ret = -EIO;
+	const u32 delayms = 100;
+	struct mhi_dev *mhi_dev = mhi_controller_get_devdata(mhi_cntrl);
+	int itr = DIV_ROUND_UP(mhi_cntrl->timeout_ms, delayms);
+
+	MHI_LOG("Entered\n");
+
+	mutex_lock(&mhi_cntrl->pm_mutex);
+
+	for (; itr; itr--) {
+		/*
+		 * This function get called soon as device entered mission mode
+		 * so most of the channels are still in disabled state. However,
+		 * sbl channels are active and clients could be trying to close
+		 * channels while we trying to suspend the link. So, we need to
+		 * re-try if MHI is busy
+		 */
+		ret = mhi_pm_suspend(mhi_cntrl);
+		if (!ret || ret != -EBUSY)
+			break;
+
+		MHI_LOG("MHI busy, sleeping and retry\n");
+		msleep(delayms);
+	}
+
+	if (ret)
+		goto exit_force_suspend;
+
+	mhi_dev->suspend_mode = MHI_DEFAULT_SUSPEND;
+	ret = mhi_arch_link_suspend(mhi_cntrl);
+
+exit_force_suspend:
+	MHI_LOG("Force suspend ret with %d\n", ret);
+
+	mutex_unlock(&mhi_cntrl->pm_mutex);
+
+	return ret;
 }
 
 /* checks if link is down */
@@ -333,63 +431,26 @@ static int mhi_link_status(struct mhi_controller *mhi_cntrl, void *priv)
 /* disable PCIe L1 */
 static int mhi_lpm_disable(struct mhi_controller *mhi_cntrl, void *priv)
 {
-	struct mhi_dev *mhi_dev = priv;
-	struct pci_dev *pci_dev = mhi_dev->pci_dev;
-	int lnkctl = pci_dev->pcie_cap + PCI_EXP_LNKCTL;
-	u8 val;
-	int ret;
-
-	ret = pci_read_config_byte(pci_dev, lnkctl, &val);
-	if (ret) {
-		MHI_ERR("Error reading LNKCTL, ret:%d\n", ret);
-		return ret;
-	}
-
-	/* L1 is not supported or already disabled */
-	if (!(val & PCI_EXP_LNKCTL_ASPM_L1))
-		return 0;
-
-	val &= ~PCI_EXP_LNKCTL_ASPM_L1;
-	ret = pci_write_config_byte(pci_dev, lnkctl, val);
-	if (ret) {
-		MHI_ERR("Error writing LNKCTL to disable LPM, ret:%d\n", ret);
-		return ret;
-	}
-
-	mhi_dev->lpm_disabled = true;
-
-	return ret;
+	return mhi_arch_link_lpm_disable(mhi_cntrl);
 }
 
 /* enable PCIe L1 */
 static int mhi_lpm_enable(struct mhi_controller *mhi_cntrl, void *priv)
 {
-	struct mhi_dev *mhi_dev = priv;
-	struct pci_dev *pci_dev = mhi_dev->pci_dev;
-	int lnkctl = pci_dev->pcie_cap + PCI_EXP_LNKCTL;
-	u8 val;
-	int ret;
+	return mhi_arch_link_lpm_enable(mhi_cntrl);
+}
 
-	/* L1 is not supported or already disabled */
-	if (!mhi_dev->lpm_disabled)
-		return 0;
+static void mhi_qcom_store_hwinfo(struct mhi_controller *mhi_cntrl)
+{
+	struct mhi_dev *mhi_dev = mhi_controller_get_devdata(mhi_cntrl);
+	int i;
 
-	ret = pci_read_config_byte(pci_dev, lnkctl, &val);
-	if (ret) {
-		MHI_ERR("Error reading LNKCTL, ret:%d\n", ret);
-		return ret;
-	}
+	mhi_dev->serial_num = readl_relaxed(mhi_cntrl->bhi +
+			MHI_BHI_SERIAL_NUM_OFFS);
 
-	val |= PCI_EXP_LNKCTL_ASPM_L1;
-	ret = pci_write_config_byte(pci_dev, lnkctl, val);
-	if (ret) {
-		MHI_ERR("Error writing LNKCTL to enable LPM, ret:%d\n", ret);
-		return ret;
-	}
-
-	mhi_dev->lpm_disabled = false;
-
-	return ret;
+	for (i = 0; i < ARRAY_SIZE(mhi_dev->oem_pk_hash); i++)
+		mhi_dev->oem_pk_hash[i] = readl_relaxed(mhi_cntrl->bhi +
+			MHI_BHI_OEMPKHASH(i));
 }
 
 static int mhi_qcom_power_up(struct mhi_controller *mhi_cntrl)
@@ -418,7 +479,19 @@ static int mhi_qcom_power_up(struct mhi_controller *mhi_cntrl)
 			return -EIO;
 	}
 
+	/* when coming out of SSR, initial states are not valid */
+	mhi_cntrl->ee = 0;
+	mhi_cntrl->power_down = false;
+
+	ret = mhi_arch_power_up(mhi_cntrl);
+	if (ret)
+		return ret;
+
 	ret = mhi_async_power_up(mhi_cntrl);
+
+	/* Update modem serial Info */
+	if (!ret)
+		mhi_qcom_store_hwinfo(mhi_cntrl);
 
 	/* power up create the dentry */
 	if (mhi_cntrl->dentry) {
@@ -453,11 +526,28 @@ static void mhi_status_cb(struct mhi_controller *mhi_cntrl,
 {
 	struct mhi_dev *mhi_dev = priv;
 	struct device *dev = &mhi_dev->pci_dev->dev;
+	int ret;
 
-	if (reason == MHI_CB_IDLE) {
-		MHI_LOG("Schedule runtime suspend 1\n");
+	switch (reason) {
+	case MHI_CB_IDLE:
+		MHI_LOG("Schedule runtime suspend\n");
 		pm_runtime_mark_last_busy(dev);
 		pm_request_autosuspend(dev);
+		break;
+	case MHI_CB_EE_MISSION_MODE:
+		/*
+		 * we need to force a suspend so device can switch to
+		 * mission mode pcie phy settings.
+		 */
+		pm_runtime_get(dev);
+		ret = mhi_force_suspend(mhi_cntrl);
+		if (!ret)
+			mhi_runtime_resume(dev);
+		pm_runtime_put(dev);
+		mhi_arch_mission_mode_enter(mhi_cntrl);
+		break;
+	default:
+		MHI_ERR("Unhandled cb:0x%x\n", reason);
 	}
 }
 
@@ -513,9 +603,45 @@ static ssize_t power_up_store(struct device *dev,
 }
 static DEVICE_ATTR_WO(power_up);
 
+static ssize_t serial_info_show(struct device *dev,
+				struct device_attribute *attr,
+				char *buf)
+{
+	struct mhi_device *mhi_device = to_mhi_device(dev);
+	struct mhi_controller *mhi_cntrl = mhi_device->mhi_cntrl;
+	struct mhi_dev *mhi_dev = mhi_controller_get_devdata(mhi_cntrl);
+	int n;
+
+	n = scnprintf(buf, PAGE_SIZE, "Serial Number:%u\n",
+		      mhi_dev->serial_num);
+
+	return n;
+}
+static DEVICE_ATTR_RO(serial_info);
+
+static ssize_t oempkhash_info_show(struct device *dev,
+				struct device_attribute *attr,
+				char *buf)
+{
+	struct mhi_device *mhi_device = to_mhi_device(dev);
+	struct mhi_controller *mhi_cntrl = mhi_device->mhi_cntrl;
+	struct mhi_dev *mhi_dev = mhi_controller_get_devdata(mhi_cntrl);
+	int i, n = 0;
+
+	for (i = 0; i < ARRAY_SIZE(mhi_dev->oem_pk_hash); i++)
+		n += scnprintf(buf + n, PAGE_SIZE - n, "OEMPKHASH[%d]:%u\n",
+		      i, mhi_dev->oem_pk_hash[i]);
+
+	return n;
+}
+static DEVICE_ATTR_RO(oempkhash_info);
+
+
 static struct attribute *mhi_qcom_attrs[] = {
 	&dev_attr_timeout_ms.attr,
 	&dev_attr_power_up.attr,
+	&dev_attr_serial_info.attr,
+	&dev_attr_oempkhash_info.attr,
 	NULL
 };
 
@@ -553,6 +679,7 @@ static struct mhi_controller *mhi_register_controller(struct pci_dev *pci_dev)
 		goto error_register;
 
 	use_bb = of_property_read_bool(of_node, "mhi,use-bb");
+	mhi_dev->allow_m1 = of_property_read_bool(of_node, "mhi,allow-m1");
 
 	/*
 	 * if s1 translation enabled or using bounce buffer pull iova addr
@@ -600,6 +727,12 @@ static struct mhi_controller *mhi_register_controller(struct pci_dev *pci_dev)
 	mhi_cntrl->lpm_disable = mhi_lpm_disable;
 	mhi_cntrl->lpm_enable = mhi_lpm_enable;
 	mhi_cntrl->time_get = mhi_time_get;
+	mhi_cntrl->remote_timer_freq = 19200000;
+	mhi_cntrl->local_timer_freq = 19200000;
+
+	/* setup host support for SFR retreival */
+	if (of_property_read_bool(of_node, "mhi,sfr-support"))
+		mhi_cntrl->sfr_len = MHI_MAX_SFR_LEN;
 
 	ret = of_register_mhi_controller(mhi_cntrl);
 	if (ret)
@@ -621,8 +754,29 @@ static struct mhi_controller *mhi_register_controller(struct pci_dev *pci_dev)
 	if (ret)
 		goto error_register;
 
+	if (mhi_dev->allow_m1)
+		goto skip_offload;
+
+	mhi_cntrl->offload_wq = alloc_ordered_workqueue("offload_wq",
+			WQ_MEM_RECLAIM | WQ_HIGHPRI);
+	if (!mhi_cntrl->offload_wq)
+		goto error_register;
+
+	INIT_WORK(&mhi_cntrl->reg_write_work, mhi_reg_write_work);
+
+	mhi_cntrl->reg_write_q = kcalloc(REG_WRITE_QUEUE_LEN,
+					sizeof(*mhi_cntrl->reg_write_q),
+					GFP_KERNEL);
+	if (!mhi_cntrl->reg_write_q)
+		goto error_free_wq;
+
+	atomic_set(&mhi_cntrl->write_idx, -1);
+
+skip_offload:
 	return mhi_cntrl;
 
+error_free_wq:
+	destroy_workqueue(mhi_cntrl->offload_wq);
 error_register:
 	mhi_free_controller(mhi_cntrl);
 
@@ -671,7 +825,6 @@ int mhi_pci_probe(struct pci_dev *pci_dev,
 	}
 
 	pm_runtime_mark_last_busy(&pci_dev->dev);
-	pm_runtime_allow(&pci_dev->dev);
 
 	MHI_LOG("Return successful\n");
 
@@ -704,6 +857,7 @@ static struct pci_device_id mhi_pcie_device_id[] = {
 	{PCI_DEVICE(MHI_PCIE_VENDOR_ID, 0x0304)},
 	{PCI_DEVICE(MHI_PCIE_VENDOR_ID, 0x0305)},
 	{PCI_DEVICE(MHI_PCIE_VENDOR_ID, 0x0306)},
+	{PCI_DEVICE(MHI_PCIE_VENDOR_ID, 0x0307)},
 	{PCI_DEVICE(MHI_PCIE_VENDOR_ID, MHI_PCIE_DEBUG_ID)},
 	{0},
 };

@@ -1711,7 +1711,7 @@ static int set_usb_data_role(struct usbpd *pd, bool attached,
 			     enum typec_data_role data,
 			     bool usb_comm_capable)
 {
-	int ret;
+	int ret = 0;
 
 	pd->extcon_usb_cc = pd->is_cable_flipped;
 
@@ -1904,7 +1904,7 @@ static void log_rtc(struct tcpc_dev *dev)
 {
 	struct usbpd *pd = container_of(dev, struct usbpd, tcpc_dev);
 
-	logbuffer_log(pd->log, NULL);
+	logbuffer_log(pd->log, "");
 
 	return;
 }

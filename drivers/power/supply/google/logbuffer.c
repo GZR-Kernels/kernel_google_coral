@@ -94,8 +94,8 @@ static void __logbuffer_log(struct logbuffer *instance,
 	}
 }
 
-static void _logbuffer_log(struct logbuffer *instance, const char *fmt,
-			   va_list args)
+void logbuffer_vlog(struct logbuffer *instance, const char *fmt,
+		    va_list args)
 {
 	char tmpbuffer[LOG_BUFFER_ENTRY_SIZE];
 	unsigned long flags;
@@ -104,8 +104,7 @@ static void _logbuffer_log(struct logbuffer *instance, const char *fmt,
 	 * The RTC is printed if thats the first message
 	 * printed after resume.
 	 */
-	if (fmt)
-		vsnprintf(tmpbuffer, sizeof(tmpbuffer), fmt, args);
+	vsnprintf(tmpbuffer, sizeof(tmpbuffer), fmt ? : "", args);
 
 	spin_lock_irqsave(&instance->logbuffer_lock, flags);
 	if (instance->logbuffer_head < 0 ||
@@ -122,7 +121,7 @@ static void _logbuffer_log(struct logbuffer *instance, const char *fmt,
 	} else if (suspend_since_last_logged) {
 		__logbuffer_log(instance, tmpbuffer, true);
 		suspend_since_last_logged = false;
-	} else if (!fmt) {
+	} else if (!fmt || !strcmp(fmt, "")) {
 		goto abort;
 	}
 
@@ -131,6 +130,7 @@ static void _logbuffer_log(struct logbuffer *instance, const char *fmt,
 abort:
 	spin_unlock_irqrestore(&instance->logbuffer_lock, flags);
 }
+EXPORT_SYMBOL_GPL(logbuffer_vlog);
 
 void logbuffer_log(struct logbuffer *instance, const char *fmt, ...)
 {
@@ -140,7 +140,7 @@ void logbuffer_log(struct logbuffer *instance, const char *fmt, ...)
 		return;
 
 	va_start(args, fmt);
-	_logbuffer_log(instance, fmt, args);
+	logbuffer_vlog(instance, fmt, args);
 	va_end(args);
 }
 EXPORT_SYMBOL_GPL(logbuffer_log);

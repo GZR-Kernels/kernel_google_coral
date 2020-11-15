@@ -19,10 +19,6 @@
 	};
 };
 
-&pcie1 {
-	qcom,boot-option = <0x0>;
-};
-
 &pcie_rc1 {
 	aqc_x4: aquantia,aqc107@pcie_rc1 {
 		reg = <0 0 0 0 0>;

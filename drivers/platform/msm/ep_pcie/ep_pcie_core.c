@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2019, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2015-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -41,11 +41,19 @@
 
 #define PCIE_MHI_STATUS(n)			((n) + 0x148)
 #define TCSR_PERST_SEPARATION_ENABLE		0x270
+#define PCIE_ISSUE_WAKE				1
+#define PCIE_MHI_FWD_STATUS_MIN			5000
+#define PCIE_MHI_FWD_STATUS_MAX			5100
+#define PCIE_MHI_FWD_COUNT			200
+#define PCIE_L1SUB_AHB_TIMEOUT_MIN		100
+#define PCIE_L1SUB_AHB_TIMEOUT_MAX		120
 
 /* debug mask sys interface */
 static int ep_pcie_debug_mask;
 static int ep_pcie_debug_keep_resource;
 static u32 ep_pcie_bar0_address;
+static bool m2_enabled;
+static u32 clkreq_irq;
 module_param_named(debug_mask, ep_pcie_debug_mask,
 			int, 0664);
 module_param_named(debug_keep_resource, ep_pcie_debug_keep_resource,
@@ -64,7 +72,7 @@ static struct ep_pcie_vreg_info_t ep_pcie_vreg_info[EP_PCIE_MAX_VREG] = {
 static struct ep_pcie_gpio_info_t ep_pcie_gpio_info[EP_PCIE_MAX_GPIO] = {
 	{"perst-gpio",      0, 0, 0, 1},
 	{"wake-gpio",       0, 1, 0, 1},
-	{"clkreq-gpio",     0, 1, 0, 0},
+	{"clkreq-gpio",     0, 0, 0, 1},
 	{"mdm2apstatus-gpio",    0, 1, 1, 0},
 };
 
@@ -440,7 +448,8 @@ static void ep_pcie_clk_deinit(struct ep_pcie_dev_t *dev)
 				dev->rev);
 	}
 
-	regulator_disable(dev->gdsc);
+	if (!m2_enabled)
+		regulator_disable(dev->gdsc);
 }
 
 static int ep_pcie_pipe_clk_init(struct ep_pcie_dev_t *dev)
@@ -566,7 +575,6 @@ static void ep_pcie_config_mmio(struct ep_pcie_dev_t *dev)
 	ep_pcie_write_reg(dev->mmio, PCIE20_MHIVER, 0x1000000);
 	ep_pcie_write_reg(dev->mmio, PCIE20_BHI_VERSION_LOWER, 0x2);
 	ep_pcie_write_reg(dev->mmio, PCIE20_BHI_VERSION_UPPER, 0x1);
-	ep_pcie_write_reg(dev->mmio, PCIE20_BHI_INTVEC, 0xffffffff);
 
 	dev->config_mmio_init = true;
 }
@@ -625,14 +633,15 @@ static void ep_pcie_core_init(struct ep_pcie_dev_t *dev, bool configured)
 		ep_pcie_write_mask(dev->dm_core +
 				PCIE20_LINK_CONTROL2_LINK_STATUS2,
 				0xf, dev->link_speed);
+
+		EP_PCIE_DBG2(dev, "PCIe V%d: Allow L1 after D3_COLD->D0\n",
+				dev->rev);
+		ep_pcie_write_mask(dev->parf + PCIE20_PARF_PM_CTRL, BIT(5), 0);
 	}
 
 	if (dev->active_config) {
 		struct resource *dbi = dev->res[EP_PCIE_RES_DM_CORE].resource;
 		u32 dbi_lo = dbi->start;
-
-		EP_PCIE_DBG2(dev, "PCIe V%d: Enable L1\n", dev->rev);
-		ep_pcie_write_mask(dev->parf + PCIE20_PARF_PM_CTRL, BIT(5), 0);
 
 		ep_pcie_write_reg(dev->parf + PCIE20_PARF_SLV_ADDR_MSB_CTRL,
 					0, BIT(0));
@@ -814,17 +823,26 @@ static void ep_pcie_core_init(struct ep_pcie_dev_t *dev, bool configured)
 			ep_pcie_write_mask(dev->parf +
 				PCIE20_PARF_INT_ALL_MASK, 0,
 				BIT(EP_PCIE_INT_EVT_EDMA));
+		if (dev->m2_autonomous)
+			ep_pcie_write_mask(dev->parf +
+				PCIE20_PARF_INT_ALL_MASK, 0,
+				BIT(EP_PCIE_INT_EVT_L1SUB_TIMEOUT));
 
 		EP_PCIE_DBG(dev, "PCIe V%d: PCIE20_PARF_INT_ALL_MASK:0x%x\n",
 			dev->rev,
 			readl_relaxed(dev->parf + PCIE20_PARF_INT_ALL_MASK));
 	}
 
-	if (dev->active_config) {
+	if (dev->active_config)
 		ep_pcie_write_reg(dev->dm_core, PCIE20_AUX_CLK_FREQ_REG, 0x14);
 
-		EP_PCIE_DBG2(dev, "PCIe V%d: Enable L1\n", dev->rev);
-		ep_pcie_write_mask(dev->parf + PCIE20_PARF_PM_CTRL, BIT(5), 0);
+		/* Prevent L1ss wakeup after 100ms */
+		ep_pcie_write_mask(dev->dm_core + PCIE20_GEN3_RELATED_OFF,
+							BIT(0), 0);
+
+		/* Disable SRIS_MODE */
+		ep_pcie_write_mask(dev->parf + PCIE20_PARF_SRIS_MODE,
+								BIT(0), 0);
 	}
 
 	if (!configured)
@@ -1014,6 +1032,7 @@ static int ep_pcie_get_resources(struct ep_pcie_dev_t *dev,
 	char prop_name[MAX_PROP_SIZE];
 	const __be32 *prop;
 	u32 *clkfreq = NULL;
+	bool map;
 
 	EP_PCIE_DBG(dev, "PCIe V%d\n", dev->rev);
 
@@ -1230,6 +1249,7 @@ static int ep_pcie_get_resources(struct ep_pcie_dev_t *dev,
 
 	for (i = 0; i < EP_PCIE_MAX_RES; i++) {
 		res_info = &dev->res[i];
+		map = false;
 
 		res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
 							res_info->name);
@@ -1237,23 +1257,30 @@ static int ep_pcie_get_resources(struct ep_pcie_dev_t *dev,
 		if (!res) {
 			EP_PCIE_ERR(dev,
 				"PCIe V%d: can't get resource for %s\n",
-				dev->rev, res_info->name);
-			ret = -ENOMEM;
-			goto out;
+					dev->rev, res_info->name);
+			if (!strcmp(res_info->name, "tcsr_pcie_perst_en")) {
+				if (!dev->tcsr_not_supported) {
+					ret = -ENOMEM;
+					goto out;
+				}
+			}
 		} else {
 			EP_PCIE_DBG(dev, "start addr for %s is %pa\n",
 				res_info->name,	&res->start);
+			map = true;
 		}
 
-		res_info->base = devm_ioremap(&pdev->dev,
-						res->start, resource_size(res));
-		if (!res_info->base) {
-			EP_PCIE_ERR(dev, "PCIe V%d: can't remap %s\n",
-				dev->rev, res_info->name);
-			ret = -ENOMEM;
-			goto out;
+		if (map) {
+			res_info->base = devm_ioremap(&pdev->dev,
+					res->start, resource_size(res));
+			if (!res_info->base) {
+				EP_PCIE_ERR(dev, "PCIe V%d: can't remap %s\n",
+					dev->rev, res_info->name);
+				ret = -ENOMEM;
+				goto out;
+			}
+			res_info->resource = res;
 		}
-		res_info->resource = res;
 	}
 
 	for (i = 0; i < EP_PCIE_MAX_IRQ; i++) {
@@ -1352,6 +1379,227 @@ done:
 	spin_unlock_irqrestore(&dev->isr_lock, irqsave_flags);
 }
 
+static bool ep_pcie_core_get_clkreq_status(void)
+{
+	struct ep_pcie_dev_t *dev = &ep_pcie_dev;
+
+	EP_PCIE_DBG(dev,
+		"PCIe V%d: PCIe get clkreq status\n", dev->rev);
+
+	return ((readl_relaxed(dev->parf +
+			PCIE20_PARF_CLKREQ_OVERRIDE) & BIT(5)) ? false : true);
+}
+
+static int ep_pcie_core_clkreq_override(bool config)
+{
+	struct ep_pcie_dev_t *dev = &ep_pcie_dev;
+
+	EP_PCIE_DBG(dev,
+		"PCIe V%d: PCIe clockreq override config:%d\n",
+						dev->rev, config);
+
+	if (config) {
+		ep_pcie_write_reg_field(dev->parf, PCIE20_PARF_CLKREQ_OVERRIDE,
+			PCIE20_PARF_CLKREQ_IN_OVERRIDE_VAL, BIT(3));
+		ep_pcie_write_reg_field(dev->parf, PCIE20_PARF_CLKREQ_OVERRIDE,
+			PCIE20_PARF_CLKREQ_IN_OVERRIDE_ENABLE, BIT(1));
+	} else {
+		ep_pcie_write_reg_field(dev->parf, PCIE20_PARF_CLKREQ_OVERRIDE,
+			PCIE20_PARF_CLKREQ_IN_OVERRIDE_ENABLE, 0);
+		ep_pcie_write_reg_field(dev->parf, PCIE20_PARF_CLKREQ_OVERRIDE,
+			PCIE20_PARF_CLKREQ_IN_OVERRIDE_VAL, 0);
+	}
+
+	return 0;
+}
+
+static int ep_pcie_core_config_inact_timer(struct ep_pcie_inactivity *param)
+{
+	struct ep_pcie_dev_t *dev = &ep_pcie_dev;
+
+	EP_PCIE_DBG(dev,
+		"PCIe V%d: PCIe config inact timer\n", dev->rev);
+
+	if (!param->enable) {
+		EP_PCIE_DBG(&ep_pcie_dev,
+			"PCIe V%d: timer value being disabled:0x%x\n",
+			ep_pcie_dev.rev, param->enable);
+		ep_pcie_write_reg_field(dev->parf,
+			PCIE20_PARF_DEBUG_INT_EN,
+			PCIE20_PARF_DEBUG_INT_EN_L1SUB_TIMEOUT_BIT_MASK, 0);
+		return 0;
+	}
+
+	if (param->timer_us & BIT(31)) {
+		EP_PCIE_DBG(&ep_pcie_dev,
+			"PCIe V%d: timer value is a 31 bit value:0x%x\n",
+			ep_pcie_dev.rev, param->timer_us);
+		return -EINVAL;
+	}
+
+	EP_PCIE_DBG(&ep_pcie_dev,
+			"PCIe V%d: timer value being programmed:0x%x\n",
+			ep_pcie_dev.rev, param->timer_us);
+
+	ep_pcie_write_reg_field(dev->parf,
+			PCIE20_PARF_L1SUB_AHB_CLK_MAX_TIMER,
+			PCIE20_PARF_L1SUB_AHB_CLK_MAX_TIMER_RESET_MASK, 0x1);
+
+	usleep_range(PCIE_L1SUB_AHB_TIMEOUT_MIN, PCIE_L1SUB_AHB_TIMEOUT_MAX);
+	ep_pcie_write_reg(dev->parf,
+			PCIE20_PARF_L1SUB_AHB_CLK_MAX_TIMER,
+			param->timer_us);
+	usleep_range(PCIE_L1SUB_AHB_TIMEOUT_MIN, PCIE_L1SUB_AHB_TIMEOUT_MAX);
+
+	ep_pcie_write_reg_field(dev->parf,
+			PCIE20_PARF_L1SUB_AHB_CLK_MAX_TIMER,
+			PCIE20_PARF_L1SUB_AHB_CLK_MAX_TIMER_RESET_MASK, 0x0);
+
+	/* Enable L1SUB timeout bit to enable corresponding aggregated irq */
+	ep_pcie_write_reg_field(dev->parf,
+			PCIE20_PARF_DEBUG_INT_EN,
+			PCIE20_PARF_DEBUG_INT_EN_L1SUB_TIMEOUT_BIT_MASK,
+			BIT(0));
+
+	return 0;
+}
+
+
+static int ep_pcie_core_config_l1ss_sleep_mode(bool config)
+{
+	struct ep_pcie_dev_t *dev = &ep_pcie_dev;
+
+	EP_PCIE_DBG(dev,
+		"PCIe V%d:PCIe l1ss sleep mode:%d\n", dev->rev, config);
+
+	if (config)
+		ep_pcie_write_reg_field(dev->parf,
+				PCIE20_PARF_L1SS_SLEEP_MODE_HANDLER_CONFIG,
+				BIT(0), 1);
+	else
+		ep_pcie_write_reg_field(dev->parf,
+				PCIE20_PARF_L1SS_SLEEP_MODE_HANDLER_CONFIG,
+				BIT(0), 0);
+
+	return 0;
+}
+
+static int ep_pcie_core_l1ss_sleep_config_disable(void)
+{
+	int rc = 0, mhi_fwd_status = 0, mhi_fwd_status_cnt = 0;
+	struct ep_pcie_dev_t *dev = &ep_pcie_dev;
+
+	EP_PCIE_DBG(dev,
+		"PCIe V%d:l1ss sleep disable config\n",
+		dev->rev);
+
+	EP_PCIE_DBG(dev, "PCIe V%d:Ungate CLKREQ#\n", dev->rev);
+
+	/* Undo CLKREQ# override */
+	rc = ep_pcie_core_clkreq_override(false);
+	if (rc < 0) {
+		EP_PCIE_ERR(dev, "PCIe V%d:CLKREQ# override config failed\n",
+							dev->rev);
+		return rc;
+	}
+
+	EP_PCIE_DBG(dev, "PCIe V%d:Disable L1ss\n", dev->rev);
+
+	/* Disable L1ss sleep mode */
+	rc = ep_pcie_core_config_l1ss_sleep_mode(false);
+	if (rc < 0) {
+		EP_PCIE_ERR(dev, "PCIe V%d:L1ss sleep deconfig failed\n",
+							dev->rev);
+		return rc;
+	}
+
+	/* Check MHI_FWD status */
+	while (!mhi_fwd_status &&
+			mhi_fwd_status_cnt <= PCIE_MHI_FWD_COUNT) {
+		mhi_fwd_status = (readl_relaxed(dev->parf +
+			PCIE20_PARF_L1SS_SLEEP_MODE_HANDLER_STATUS) &
+			PCIE20_PARF_L1SS_SLEEP_MHI_FWD_DISABLE);
+		mhi_fwd_status_cnt++;
+		usleep_range(PCIE_MHI_FWD_STATUS_MIN,
+				PCIE_MHI_FWD_STATUS_MAX);
+	}
+
+	if (mhi_fwd_status >= PCIE_MHI_FWD_COUNT) {
+		EP_PCIE_ERR(dev, "PCIe V%d:MHI FWD status not set\n", dev->rev);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+int ep_pcie_core_l1ss_sleep_config_enable(void)
+{
+	int rc, ret, mhi_fwd_status = 1, mhi_fwd_status_cnt = 0;
+	struct ep_pcie_dev_t *dev = &ep_pcie_dev;
+
+	EP_PCIE_DBG(dev,
+		"PCIe V%d: l1ss sleep enable config\n", dev->rev);
+
+	enable_irq(clkreq_irq);
+
+	/* Enable CLKREQ# override */
+	rc = ep_pcie_core_clkreq_override(true);
+	if (rc < 0) {
+		EP_PCIE_ERR(dev, "PCIe V%d:CLKREQ# override config failed\n",
+							dev->rev);
+		return rc;
+	}
+
+	if (ep_pcie_core_get_clkreq_status()) {
+		EP_PCIE_DBG(dev, "PCIe V%d:CLKREQ status is set\n", dev->rev);
+		rc = -EINVAL;
+		goto disable_clkreq;
+	}
+
+	/* Enter L1ss sleep mode */
+	rc = ep_pcie_core_config_l1ss_sleep_mode(true);
+	if (rc < 0) {
+		EP_PCIE_DBG(dev, "PCIe V%d:L1ss sleep config failed\n",
+								dev->rev);
+		goto disable_clkreq;
+	}
+
+	/* Check MHI_FWD status */
+	while (mhi_fwd_status &&
+			mhi_fwd_status_cnt <= PCIE_MHI_FWD_COUNT) {
+		mhi_fwd_status = (readl_relaxed(dev->parf +
+			PCIE20_PARF_L1SS_SLEEP_MODE_HANDLER_STATUS) &
+			PCIE20_PARF_L1SS_SLEEP_MHI_FWD_ENABLE);
+		mhi_fwd_status_cnt++;
+		usleep_range(PCIE_MHI_FWD_STATUS_MIN,
+				PCIE_MHI_FWD_STATUS_MAX);
+	}
+
+	if (mhi_fwd_status >= PCIE_MHI_FWD_COUNT) {
+		EP_PCIE_DBG(dev, "PCIe V%d:MHI FWD status not set\n", dev->rev);
+		rc = -EINVAL;
+		goto disable_l1ss_sleep_mode;
+	}
+
+	m2_enabled = true;
+
+	return 0;
+
+disable_l1ss_sleep_mode:
+	ret = ep_pcie_core_config_l1ss_sleep_mode(false);
+	if (ret)
+		EP_PCIE_DBG(dev, "PCIe V%d:Disable L1ss sleep mode with %d\n",
+								dev->rev, ret);
+disable_clkreq:
+	ret = ep_pcie_core_clkreq_override(false);
+	if (ret)
+		EP_PCIE_DBG(dev, "PCIe V%d:CLKREQ# override config failed%d\n",
+								dev->rev, ret);
+
+	return rc;
+}
+EXPORT_SYMBOL(ep_pcie_core_l1ss_sleep_config_enable);
+
 int ep_pcie_core_enable_endpoint(enum ep_pcie_options opt)
 {
 	int ret = 0;
@@ -1403,26 +1651,28 @@ int ep_pcie_core_enable_endpoint(enum ep_pcie_options opt)
 
 		dev->power_on = true;
 
-		 EP_PCIE_DBG(dev,
-			 "TCSR PERST_EN value before configure:0x%x\n",
-			 readl_relaxed(dev->tcsr_perst_en + 0x258));
+		if (!dev->tcsr_not_supported) {
+			EP_PCIE_DBG(dev,
+				"TCSR PERST_EN value before configure:0x%x\n",
+				readl_relaxed(dev->tcsr_perst_en + 0x258));
 
-		 /*
-		  * Delatch PERST_EN with TCSR to avoid device reset
-		  * during host reboot case.
-		  */
-		 writel_relaxed(0, dev->tcsr_perst_en + 0x258);
+			/*
+			 * Delatch PERST_EN with TCSR to avoid device reset
+			 * during host reboot case.
+			 */
+			writel_relaxed(0, dev->tcsr_perst_en + 0x258);
 
-		 EP_PCIE_DBG(dev,
-			 "TCSR PERST_EN value after configure:0x%x\n",
-			 readl_relaxed(dev->tcsr_perst_en + 0x258));
+			EP_PCIE_DBG(dev,
+				"TCSR PERST_EN value after configure:0x%x\n",
+				readl_relaxed(dev->tcsr_perst_en + 0x258));
 
-		/*
-		 * Delatch PERST_SEPARATION_ENABLE with TCSR to avoid
-		 * device reset during host reboot and hibernate case.
-		 */
-		writel_relaxed(0, dev->tcsr_perst_en +
-					TCSR_PERST_SEPARATION_ENABLE);
+			/*
+			 * Delatch PERST_SEPARATION_ENABLE with TCSR to avoid
+			 * device reset during host reboot and hibernate case.
+			 */
+			writel_relaxed(0, dev->tcsr_perst_en +
+						TCSR_PERST_SEPARATION_ENABLE);
+		}
 
 		 /* check link status during initial bootup */
 		if (!dev->enumerated) {
@@ -1476,19 +1726,21 @@ int ep_pcie_core_enable_endpoint(enum ep_pcie_options opt)
 	if (!(opt & EP_PCIE_OPT_ENUM))
 		goto out;
 
-	EP_PCIE_DBG(dev,
-		"TCSR PERST_EN value before configure:0x%x\n",
-		readl_relaxed(dev->tcsr_perst_en + 0x258));
+	if (!dev->tcsr_not_supported) {
+		EP_PCIE_DBG(dev,
+			"TCSR PERST_EN value before configure:0x%x\n",
+			readl_relaxed(dev->tcsr_perst_en + 0x258));
 
-	/*
-	 * Delatch PERST_EN with TCSR to avoid device reset
-	 * during host reboot case.
-	 */
-	writel_relaxed(0, dev->tcsr_perst_en + 0x258);
+		/*
+		 * Delatch PERST_EN with TCSR to avoid device reset
+		 * during host reboot case.
+		 */
+		writel_relaxed(0, dev->tcsr_perst_en + 0x258);
 
-	EP_PCIE_DBG(dev,
-		"TCSR PERST_EN value after configure:0x%x\n",
-		readl_relaxed(dev->tcsr_perst_en));
+		EP_PCIE_DBG(dev,
+			"TCSR PERST_EN value after configure:0x%x\n",
+			readl_relaxed(dev->tcsr_perst_en));
+	}
 
 	if (opt & EP_PCIE_OPT_AST_WAKE) {
 		/* assert PCIe WAKE# */
@@ -1541,9 +1793,6 @@ int ep_pcie_core_enable_endpoint(enum ep_pcie_options opt)
 		}
 	}
 
-	ret = ep_pcie_reset_init(dev);
-	if (ret)
-		goto link_fail;
 	/* init PCIe PHY */
 	ep_pcie_phy_init(dev);
 
@@ -1625,6 +1874,14 @@ int ep_pcie_core_enable_endpoint(enum ep_pcie_options opt)
 	}
 
 checkbme:
+	/*
+	 * De-assert WAKE# GPIO following link until L2/3 and WAKE#
+	 * is triggered to send data from device to host at which point
+	 * it will assert WAKE#.
+	 */
+	gpio_set_value(dev->gpio[EP_PCIE_GPIO_WAKE].num,
+			1 - dev->gpio[EP_PCIE_GPIO_WAKE].on);
+
 	if (dev->active_config)
 		ep_pcie_write_reg(dev->dm_core, PCIE20_AUX_CLK_FREQ_REG, 0x14);
 
@@ -1707,11 +1964,13 @@ int ep_pcie_core_disable_endpoint(void)
 		goto out;
 	}
 
-	dev->link_status = EP_PCIE_LINK_DISABLED;
-	dev->power_on = false;
+	if (!m2_enabled) {
+		dev->link_status = EP_PCIE_LINK_DISABLED;
+		dev->power_on = false;
 
-	EP_PCIE_DBG(dev, "PCIe V%d: shut down the link\n",
-		dev->rev);
+		EP_PCIE_DBG(dev, "PCIe V%d: shut down the link\n",
+			dev->rev);
+	}
 
 	ep_pcie_pipe_clk_deinit(dev);
 	ep_pcie_clk_deinit(dev);
@@ -2040,7 +2299,46 @@ static irqreturn_t ep_pcie_handle_perst_irq(int irq, void *data)
 	}
 
 out:
+	/* Set trigger type based on the next expected value of perst gpio */
+	irq_set_irq_type(gpio_to_irq(dev->gpio[EP_PCIE_GPIO_PERST].num),
+		(perst ? IRQF_TRIGGER_LOW : IRQF_TRIGGER_HIGH));
+
 	spin_unlock_irqrestore(&dev->isr_lock, irqsave_flags);
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t ep_pcie_handle_clkreq_irq(int irq, void *data)
+{
+	struct ep_pcie_dev_t *dev = data;
+	int ret;
+
+	EP_PCIE_DBG(dev, "PCIe V%d: received clkreq irq\n", dev->rev);
+
+	if (!m2_enabled)
+		return IRQ_HANDLED;
+
+	disable_irq_nosync(clkreq_irq);
+	/* enable clocks */
+	ep_pcie_clk_init(dev);
+	ret = ep_pcie_pipe_clk_init(dev);
+	if (ret) {
+		EP_PCIE_ERR(dev, "PCIe V%d: failed to enable pipe clocks\n",
+			dev->rev);
+		return IRQ_HANDLED;
+	}
+
+	m2_enabled = false;
+	dev->power_on = true;
+
+	ret = ep_pcie_core_l1ss_sleep_config_disable();
+	if (ret) {
+		EP_PCIE_ERR(dev, "PCIe V%d: l1ss sleep disable failed:%d\n",
+			dev->rev, ret);
+		return IRQ_HANDLED;
+	}
+
+	ep_pcie_notify_event(dev, EP_PCIE_EVENT_L1SUB_TIMEOUT_EXIT);
 
 	return IRQ_HANDLED;
 }
@@ -2099,9 +2397,16 @@ static irqreturn_t ep_pcie_handle_global_irq(int irq, void *data)
 					dev->rev);
 				ep_pcie_handle_linkup_irq(irq, data);
 				break;
+			case EP_PCIE_INT_EVT_L1SUB_TIMEOUT:
+				EP_PCIE_DUMP(dev,
+					"PCIe V%d: handle L1ss timeout event\n",
+					dev->rev);
+				ep_pcie_notify_event(dev,
+						EP_PCIE_EVENT_L1SUB_TIMEOUT);
+				break;
 			default:
 				EP_PCIE_ERR(dev,
-					"PCIe V%d: Unexpected event %d is caught\n",
+					"PCIe V%d: Unexpected event %d\n",
 					dev->rev, i);
 			}
 		}
@@ -2222,11 +2527,18 @@ int32_t ep_pcie_irq_init(struct ep_pcie_dev_t *dev)
 	}
 
 perst_irq:
+	/*
+	 * Check initial state of perst gpio to set the trigger type
+	 * based on the next expected level of the gpio
+	 */
+	if (gpio_get_value(dev->gpio[EP_PCIE_GPIO_PERST].num) == 1)
+		dev->perst_deast = true;
+
 	/* register handler for PERST interrupt */
 	perst_irq = gpio_to_irq(dev->gpio[EP_PCIE_GPIO_PERST].num);
 	ret = devm_request_irq(pdev, perst_irq,
 		ep_pcie_handle_perst_irq,
-		IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING,
+		(dev->perst_deast ? IRQF_TRIGGER_LOW : IRQF_TRIGGER_HIGH),
 		"ep_pcie_perst", dev);
 	if (ret) {
 		EP_PCIE_ERR(dev,
@@ -2241,6 +2553,25 @@ perst_irq:
 			"PCIe V%d: Unable to enable PERST interrupt %d\n",
 			dev->rev, perst_irq);
 		return ret;
+	}
+
+	if (dev->m2_autonomous) {
+		/* register handler for clkreq interrupt */
+		EP_PCIE_ERR(dev,
+				"PCIe V%d: Register for CLKREQ interrupt %d\n",
+				dev->rev, clkreq_irq);
+		clkreq_irq = gpio_to_irq(dev->gpio[EP_PCIE_GPIO_CLKREQ].num);
+		irq_set_status_flags(clkreq_irq, IRQ_NOAUTOEN);
+		ret = devm_request_threaded_irq(pdev, clkreq_irq, NULL,
+			ep_pcie_handle_clkreq_irq,
+			IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+			"ep_pcie_clkreq", dev);
+		if (ret) {
+			EP_PCIE_ERR(dev,
+				"PCIe V%d: Unable to request CLKREQ interrupt %d\n",
+				dev->rev, clkreq_irq);
+			return ret;
+		}
 	}
 
 	return 0;
@@ -2463,7 +2794,7 @@ int ep_pcie_core_get_msi_config(struct ep_pcie_msi_config *cfg)
 					msi->start, 0, msi->end,
 					lower, upper);
 
-		if (ep_pcie_dev.active_config) {
+		if (ep_pcie_dev.active_config || ep_pcie_dev.pcie_edma) {
 			cfg->lower = lower;
 			cfg->upper = upper;
 		} else {
@@ -2570,9 +2901,36 @@ int ep_pcie_core_trigger_msi(u32 idx)
 	return EP_PCIE_ERROR;
 }
 
-int ep_pcie_core_wakeup_host(void)
+static void ep_pcie_core_issue_inband_pme(void)
 {
 	struct ep_pcie_dev_t *dev = &ep_pcie_dev;
+	unsigned long irqsave_flags;
+	u32 pm_ctrl = 0;
+
+	spin_lock_irqsave(&dev->isr_lock, irqsave_flags);
+
+	EP_PCIE_DBG(dev,
+		"PCIe V%d: request to assert inband wake\n",
+		dev->rev);
+
+	pm_ctrl = readl_relaxed(dev->parf + PCIE20_PARF_PM_CTRL);
+	ep_pcie_write_reg(dev->parf, PCIE20_PARF_PM_CTRL,
+						(pm_ctrl | BIT(4)));
+	ep_pcie_write_reg(dev->parf, PCIE20_PARF_PM_CTRL, pm_ctrl);
+
+	EP_PCIE_DBG(dev,
+		"PCIe V%d: completed assert for inband wake\n",
+		dev->rev);
+
+	spin_unlock_irqrestore(&dev->isr_lock, irqsave_flags);
+}
+
+static int ep_pcie_core_wakeup_host(enum ep_pcie_event event)
+{
+	struct ep_pcie_dev_t *dev = &ep_pcie_dev;
+
+	if (event == EP_PCIE_EVENT_PM_D3_HOT)
+		ep_pcie_core_issue_inband_pme();
 
 	if (dev->perst_deast && !dev->l23_ready) {
 		EP_PCIE_ERR(dev,
@@ -2587,8 +2945,9 @@ int ep_pcie_core_wakeup_host(void)
 		dev->rev, dev->wake_counter,
 		dev->perst_deast ? "" : "not",
 		dev->l23_ready ? "" : "not");
-	gpio_set_value(dev->gpio[EP_PCIE_GPIO_WAKE].num,
-			1 - dev->gpio[EP_PCIE_GPIO_WAKE].on);
+	/*
+	 * Assert WAKE# GPIO until link is back to L0.
+	 */
 	gpio_set_value(dev->gpio[EP_PCIE_GPIO_WAKE].num,
 			dev->gpio[EP_PCIE_GPIO_WAKE].on);
 	return 0;
@@ -2628,6 +2987,7 @@ struct ep_pcie_hw hw_drv = {
 	.enable_endpoint = ep_pcie_core_enable_endpoint,
 	.disable_endpoint = ep_pcie_core_disable_endpoint,
 	.mask_irq_event = ep_pcie_core_mask_irq_event,
+	.configure_inactivity_timer = ep_pcie_core_config_inact_timer,
 };
 
 static int ep_pcie_probe(struct platform_device *pdev)
@@ -2751,8 +3111,22 @@ static int ep_pcie_probe(struct platform_device *pdev)
 		"PCIe V%d: enum by PERST is %s enabled\n",
 		ep_pcie_dev.rev, ep_pcie_dev.perst_enum ? "" : "not");
 
+	ep_pcie_dev.tcsr_not_supported = of_property_read_bool
+		((&pdev->dev)->of_node,
+				"qcom,tcsr-not-supported");
+	EP_PCIE_DBG(&ep_pcie_dev,
+		"PCIe V%d: tcsr pcie perst is %s supported\n",
+		ep_pcie_dev.rev, ep_pcie_dev.tcsr_not_supported ? "not" : "");
+
 	ep_pcie_dev.rev = 1711211;
 	ep_pcie_dev.pdev = pdev;
+	ep_pcie_dev.m2_autonomous =
+		of_property_read_bool((&pdev->dev)->of_node,
+				"qcom,pcie-m2-autonomous");
+	EP_PCIE_DBG(&ep_pcie_dev,
+		"PCIe V%d: MHI M2 autonomous is %s enabled\n",
+		ep_pcie_dev.rev, ep_pcie_dev.m2_autonomous ? "" : "not");
+
 	memcpy(ep_pcie_dev.vreg, ep_pcie_vreg_info,
 				sizeof(ep_pcie_vreg_info));
 	memcpy(ep_pcie_dev.gpio, ep_pcie_gpio_info,
@@ -2837,12 +3211,14 @@ static int ep_pcie_probe(struct platform_device *pdev)
 	}
 skip_mapping:
 	ret = ep_pcie_enumeration(&ep_pcie_dev);
-	if (IS_ENABLED(CONFIG_QCOM_PCI_EDMA))
-		qcom_edma_init(&pdev->dev);
+	if (ret && !ep_pcie_debug_keep_resource)
+		goto irq_deinit;
 
-	if (!ret || ep_pcie_debug_keep_resource)
-		return 0;
+	qcom_edma_init(&pdev->dev);
 
+	return 0;
+
+irq_deinit:
 	ep_pcie_irq_deinit(&ep_pcie_dev);
 irq_failure:
 	ep_pcie_gpio_deinit(&ep_pcie_dev);

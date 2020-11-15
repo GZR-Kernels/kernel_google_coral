@@ -1,4 +1,4 @@
-/* Copyright (c) 2016, 2019, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2016, 2019-2020 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -24,20 +24,20 @@
 #include <linux/list.h>
 #include <linux/export.h>
 #include <linux/types.h>
-#include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/mm.h>
 #include <asm/arch_timer.h>
 #include <soc/qcom/boot_stats.h>
 
 #define MAX_STRING_LEN 256
-#define BOOT_MARKER_MAX_LEN 40
+#define BOOT_MARKER_MAX_LEN 50
 #define MSM_ARCH_TIMER_FREQ     19200000
 
 struct boot_marker {
 	char marker_name[BOOT_MARKER_MAX_LEN];
 	unsigned long long int timer_value;
 	struct list_head list;
-	struct mutex lock;
+	spinlock_t slock;
 };
 
 static struct dentry *dent_bkpi, *dent_bkpi_status, *dent_mpm_timer;
@@ -48,7 +48,7 @@ static void _destroy_boot_marker(const char *name)
 	struct boot_marker *marker;
 	struct boot_marker *temp_addr;
 
-	mutex_lock(&boot_marker_list.lock);
+	spin_lock(&boot_marker_list.slock);
 	list_for_each_entry_safe(marker, temp_addr, &boot_marker_list.list,
 			list) {
 		if (strnstr(marker->marker_name, name,
@@ -57,7 +57,7 @@ static void _destroy_boot_marker(const char *name)
 			kfree(marker);
 		}
 	}
-	mutex_unlock(&boot_marker_list.lock);
+	spin_unlock(&boot_marker_list.slock);
 }
 
 static void _create_boot_marker(const char *name,
@@ -70,7 +70,7 @@ static void _create_boot_marker(const char *name,
 			((timer_value % TIMER_KHZ)
 			 * 1000) / TIMER_KHZ);
 
-	new_boot_marker = kmalloc(sizeof(*new_boot_marker), GFP_KERNEL);
+	new_boot_marker = kmalloc(sizeof(*new_boot_marker), GFP_ATOMIC);
 	if (!new_boot_marker)
 		return;
 
@@ -78,22 +78,58 @@ static void _create_boot_marker(const char *name,
 			sizeof(new_boot_marker->marker_name));
 	new_boot_marker->timer_value = timer_value;
 
-	mutex_lock(&boot_marker_list.lock);
+	spin_lock(&boot_marker_list.slock);
 	list_add_tail(&(new_boot_marker->list), &(boot_marker_list.list));
-	mutex_unlock(&boot_marker_list.lock);
+	spin_unlock(&boot_marker_list.slock);
 }
 
-static void set_bootloader_stats(void)
+static void set_bootloader_stats(bool hibernation_restore)
 {
-	_create_boot_marker("M - ABL Start - ",
+	_create_boot_marker("M - APPSBL Start - ",
 		readl_relaxed(&boot_stats->bootloader_start));
-	_create_boot_marker("M - ABL End - ",
+	if (!hibernation_restore) {
+		_create_boot_marker("D - APPSBL Kernel Load Start - ",
+			readl_relaxed(&boot_stats->load_kernel_start));
+		_create_boot_marker("D - APPSBL Kernel Load End - ",
+			readl_relaxed(&boot_stats->load_kernel_done));
+		_create_boot_marker("D - APPSBL Kernel Load Time - ",
+			readl_relaxed(&boot_stats->bootloader_load_kernel));
+		_create_boot_marker("D - APPSBL Kernel Auth Time - ",
+			readl_relaxed(&boot_stats->bootloader_chksum_time));
+	} else {
+		_create_boot_marker("D - APPSBL Hibernation Image Load Start -",
+			readl_relaxed(&boot_stats->load_kernel_start));
+		_create_boot_marker("D - APPSBL Hibernation Image Load End - ",
+			readl_relaxed(&boot_stats->load_kernel_done));
+	}
+	_create_boot_marker("M - APPSBL End - ",
 		readl_relaxed(&boot_stats->bootloader_end));
+}
+
+static void boot_marker_cleanup(void)
+{
+	struct boot_marker *marker;
+	struct boot_marker *temp_addr;
+
+	spin_lock(&boot_marker_list.slock);
+	list_for_each_entry_safe(marker, temp_addr, &boot_marker_list.list,
+			list) {
+		list_del(&marker->list);
+		kfree(marker);
+	}
+	spin_unlock(&boot_marker_list.slock);
 }
 
 void place_marker(const char *name)
 {
-	_create_boot_marker((char *) name, msm_timer_get_sclk_ticks());
+#ifdef CONFIG_HIBERNATION
+	if (!strcmp(name, "M - Image Kernel Start")) {
+		/* In restore phase, remove Cold Boot KPIs */
+		boot_marker_cleanup();
+		set_bootloader_stats(true);
+	}
+#endif /* CONFIG_HIBERNATION */
+	_create_boot_marker((char *)name, msm_timer_get_sclk_ticks());
 }
 EXPORT_SYMBOL(place_marker);
 
@@ -143,7 +179,7 @@ static ssize_t bootkpi_reader(struct file *fp, char __user *user_buffer,
 	if (!buf)
 		return -ENOMEM;
 
-	mutex_lock(&boot_marker_list.lock);
+	spin_lock(&boot_marker_list.slock);
 	list_for_each_entry(marker, &boot_marker_list.list, list) {
 		temp += scnprintf(buf + temp, PAGE_SIZE - temp,
 				"%-41s:%llu.%03llu seconds\n",
@@ -152,7 +188,7 @@ static ssize_t bootkpi_reader(struct file *fp, char __user *user_buffer,
 				(((marker->timer_value % TIMER_KHZ)
 				  * 1000) / TIMER_KHZ));
 	}
-	mutex_unlock(&boot_marker_list.lock);
+	spin_unlock(&boot_marker_list.slock);
 	rc = simple_read_from_buffer(user_buffer, count, position, buf, temp);
 	kfree(buf);
 	return rc;
@@ -256,25 +292,16 @@ static int __init init_bootkpi(void)
 	}
 
 	INIT_LIST_HEAD(&boot_marker_list.list);
-	mutex_init(&boot_marker_list.lock);
-	set_bootloader_stats();
+	spin_lock_init(&boot_marker_list.slock);
+	set_bootloader_stats(false);
 	return 0;
 }
 subsys_initcall(init_bootkpi);
 
 static void __exit exit_bootkpi(void)
 {
-	struct boot_marker *marker;
-	struct boot_marker *temp_addr;
-
 	debugfs_remove_recursive(dent_bkpi);
-	mutex_lock(&boot_marker_list.lock);
-	list_for_each_entry_safe(marker, temp_addr, &boot_marker_list.list,
-			list) {
-		list_del(&marker->list);
-		kfree(marker);
-	}
-	mutex_unlock(&boot_marker_list.lock);
+	boot_marker_cleanup();
 	boot_stats_exit();
 }
 module_exit(exit_bootkpi);

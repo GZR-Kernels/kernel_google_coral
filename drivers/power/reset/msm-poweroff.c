@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2019, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -29,6 +29,7 @@
 #include <linux/notifier.h>
 #include <linux/kallsyms.h>
 #include <linux/io.h>
+#include <linux/syscore_ops.h>
 
 #include <asm/cacheflush.h>
 #include <asm/system_misc.h>
@@ -93,7 +94,7 @@ static void *dload_type_addr;
 static bool dload_mode_enabled;
 static void *emergency_dload_mode_addr;
 #ifdef CONFIG_RANDOMIZE_BASE
-static void *kaslr_imem_addr;
+static void __iomem *kaslr_imem_addr;
 #endif
 static bool scm_dload_supported;
 
@@ -160,8 +161,8 @@ static int panic_prep_restart(struct notifier_block *this,
 		goto out;
 
 	if (tombstone) { /* tamper the panic message for Oops */
-		char pc_symn[KSYM_NAME_LEN] = "<unknown>";
-		char lr_symn[KSYM_NAME_LEN] = "<unknown>";
+		char pc_symn[KSYM_SYMBOL_LEN] = "<unknown>";
+		char lr_symn[KSYM_SYMBOL_LEN] = "<unknown>";
 
 #if defined(CONFIG_ARM)
 		sprint_symbol(pc_symn, tombstone->regs->ARM_pc);
@@ -171,11 +172,11 @@ static int panic_prep_restart(struct notifier_block *this,
 		sprint_symbol(lr_symn, tombstone->regs->regs[30]);
 #endif
 
-		snprintf(kernel_panic_msg, rst_msg_size - 1,
+		scnprintf(kernel_panic_msg, rst_msg_size - 1,
 				"KP: %s PC:%s LR:%s",
 				current->comm, pc_symn, lr_symn);
 	} else {
-		snprintf(kernel_panic_msg, rst_msg_size - 1,
+		scnprintf(kernel_panic_msg, rst_msg_size - 1,
 				"KP: %s", (char *)ptr);
 	}
 
@@ -204,6 +205,9 @@ int scm_set_dload_mode(int arg1, int arg2)
 
 		return 0;
 	}
+	if (!is_scm_armv8())
+		return scm_call_atomic2(SCM_SVC_BOOT, SCM_DLOAD_CMD, arg1,
+					arg2);
 
 	return scm_call2_atomic(SCM_SIP_FNID(SCM_SVC_BOOT, SCM_DLOAD_CMD),
 				&desc);
@@ -316,7 +320,11 @@ static void scm_disable_sdi(void)
 	};
 
 	/* Needed to bypass debug image on some chips */
-	ret = scm_call2_atomic(SCM_SIP_FNID(SCM_SVC_BOOT,
+	if (!is_scm_armv8())
+		ret = scm_call_atomic2(SCM_SVC_BOOT,
+			SCM_WDOG_DEBUG_BOOT_PART, 1, 0);
+	else
+		ret = scm_call2_atomic(SCM_SIP_FNID(SCM_SVC_BOOT,
 			  SCM_WDOG_DEBUG_BOOT_PART), &desc);
 	if (ret)
 		pr_err("Failed to disable secure wdog debug: %d\n", ret);
@@ -343,7 +351,11 @@ static void halt_spmi_pmic_arbiter(void)
 
 	if (scm_pmic_arbiter_disable_supported) {
 		pr_crit("Calling SCM to disable SPMI PMIC arbiter\n");
-		scm_call2_atomic(SCM_SIP_FNID(SCM_SVC_PWR,
+		if (!is_scm_armv8())
+			scm_call_atomic1(SCM_SVC_PWR,
+					SCM_IO_DISABLE_PMIC_ARBITER, 0);
+		else
+			scm_call2_atomic(SCM_SIP_FNID(SCM_SVC_PWR,
 				SCM_IO_DISABLE_PMIC_ARBITER), &desc);
 	}
 }
@@ -679,6 +691,25 @@ int restart_handler_init(void)
 	return 0;
 }
 
+#if defined(CONFIG_RANDOMIZE_BASE) && defined(CONFIG_HIBERNATION)
+static void msm_poweroff_syscore_resume(void)
+{
+#define KASLR_OFFSET_BIT_MASK	0x00000000FFFFFFFF
+	if (kaslr_imem_addr) {
+		__raw_writel(0xdead4ead, kaslr_imem_addr);
+		__raw_writel(KASLR_OFFSET_BIT_MASK &
+		(kimage_vaddr - KIMAGE_VADDR), kaslr_imem_addr + 4);
+		__raw_writel(KASLR_OFFSET_BIT_MASK &
+			((kimage_vaddr - KIMAGE_VADDR) >> 32),
+			kaslr_imem_addr + 8);
+	}
+}
+
+static struct syscore_ops msm_poweroff_syscore_ops = {
+	.resume = msm_poweroff_syscore_resume,
+};
+#endif
+
 static int msm_restart_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -731,8 +762,11 @@ static int msm_restart_probe(struct platform_device *pdev)
 		__raw_writel(KASLR_OFFSET_BIT_MASK &
 			((kimage_vaddr - KIMAGE_VADDR) >> 32),
 			kaslr_imem_addr + 8);
-		iounmap(kaslr_imem_addr);
 	}
+
+#ifdef CONFIG_HIBERNATION
+	register_syscore_ops(&msm_poweroff_syscore_ops);
+#endif
 #endif
 	np = of_find_compatible_node(NULL, NULL,
 				"qcom,msm-imem-dload-type");
@@ -810,6 +844,9 @@ err_restart_reason:
 #ifdef CONFIG_QCOM_DLOAD_MODE
 	iounmap(emergency_dload_mode_addr);
 	iounmap(dload_mode_addr);
+#ifdef CONFIG_RANDOMIZE_BASE
+	iounmap(kaslr_imem_addr);
+#endif
 #endif
 	return ret;
 }
