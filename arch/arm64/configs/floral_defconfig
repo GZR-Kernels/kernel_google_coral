@@ -751,7 +751,7 @@ CONFIG_XZ_DEC=y
 #
 # IllusionKernel special additions
 #
-CONFIG_LOCALVERSION="-IllusionKernel"
+CONFIG_LOCALVERSION="-GzospKernel"
 # CONFIG_LOCALVERSION_AUTO is not set
 CONFIG_QCA_CLD_WLAN=y
 CONFIG_QCACLD_WLAN_LFR3=y
